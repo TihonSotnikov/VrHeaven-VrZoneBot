@@ -1,0 +1,198 @@
+"""Учётные записи, периоды и выплаты на уровне данных."""
+
+from decimal import Decimal
+
+from helpers import bind, create_admin, create_owner, make_order
+
+from db import DEFAULT_PERCENTS, SETTINGS_DEFAULTS
+
+
+def cents(x: float) -> Decimal:
+    return Decimal(repr(round(x, 2)))
+
+
+async def test_default_percents_thirty_owner_zero_admin(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    assert DEFAULT_PERCENTS == {"owner": 30, "admin": 0}
+    assert owner["percent"] == 30 and admin["percent"] == 0
+
+
+async def test_explicit_percent_overrides_default(db):
+    owner = await create_owner(db, percent=12.5)
+    assert owner["percent"] == 12.5
+
+
+async def test_handle_belongs_only_to_an_active_account(db):
+    owner = await create_owner(db, "club")
+    assert await db.handle_available("club") is False
+    async with db.write() as tx:
+        await db.set_user_active(tx, owner["id"], False)
+    assert await db.handle_available("club") is True
+    async with db.write() as tx:
+        await db.set_user_active(tx, owner["id"], True)
+    assert await db.handle_available("club") is False
+    async with db.write() as tx:
+        await db.delete_user(tx, owner["id"])
+    assert await db.handle_available("club") is True
+
+
+async def test_reissued_handle_keeps_old_history(db):
+    first = await create_owner(db, "club")
+    admin = await create_admin(db, first)
+    await make_order(db, admin, first, price=300)
+    async with db.write() as tx:
+        await db.delete_user(tx, admin["id"])
+        await db.delete_user(tx, first["id"])
+    second = await create_owner(db, "club")
+    assert second["id"] != first["id"]
+    orders = await db.export_orders()
+    assert len(orders) == 1 and orders[0]["owner_handle"] == "club"
+
+
+async def test_deleted_user_loses_access_on_every_device(db):
+    owner = await create_owner(db)
+    await bind(db, owner, 101)
+    await bind(db, owner, 102)
+    async with db.write() as tx:
+        await db.delete_user(tx, owner["id"])
+    assert await db.get_user_by_chat(101) is None
+    assert await db.chats_for_user(owner["id"]) == []
+
+
+async def test_shares_are_paid_independently(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        payout = await db.create_payout(tx, admin)
+    assert payout[1] == 50.0
+    order = await db.get_order(1)
+    assert order["admin_payout_id"] is not None
+    assert order["owner_payout_id"] is None
+    assert (await db.owner_unpaid_total(owner["id"]))["due_sum"] == 90.0
+
+
+async def test_second_payout_covers_only_new_orders(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        await db.create_payout(tx, admin)
+    await make_order(db, admin, owner, price=500, series_pos=2)
+    async with db.write() as tx:
+        second = await db.create_payout(tx, admin)
+    assert second[1] == 100.0 and second[2] == 1
+
+
+async def test_payout_amount_is_cent_exact_over_messy_orders(db):
+    owner = await create_owner(db, percent=33.3)
+    admin = await create_admin(db, owner)
+    prices = [0.01, 9.99, 123.45, 999.99, 54321.09]
+    for index, price in enumerate(prices, start=1):
+        await make_order(db, admin, owner, price=price, series_pos=index)
+    async with db.write() as tx:
+        payout = await db.create_payout(tx, owner)
+    expected = sum(cents(round(p * 33.3 / 100, 2)) for p in prices)
+    assert cents(payout[1]) == expected
+
+
+async def test_payout_that_closes_nothing_is_not_created(db):
+    """Пустых записей о выплате не бывает: не закрыв ни одной строки,
+    выплата удаляет саму себя."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        assert await db.create_payout(tx, owner) is not None
+    async with db.write() as tx:
+        assert await db.create_payout(tx, owner) is None
+    assert len(await db.payouts_for_user(owner["id"])) == 1
+
+
+async def test_periods_are_isolated_between_accounts(db):
+    owner = await create_owner(db)
+    other = await create_owner(db, "own2")
+    mine = await create_admin(db, owner, "mine")
+    theirs = await create_admin(db, other, "theirs")
+    await make_order(db, mine, owner, price=300)
+    await make_order(db, theirs, other, price=500)
+    assert (await db.admin_unpaid_total(mine["id"]))["orders_count"] == 1
+    assert (await db.owner_unpaid_total(owner["id"]))["share_sum"] == 90.0
+    assert (await db.owner_unpaid_total(other["id"]))["share_sum"] == 150.0
+
+
+async def test_cancelled_order_leaves_calculations_but_stays_in_export(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    order_id = await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        await db.cancel_order(tx, order_id, for_self=False)
+    assert (await db.admin_unpaid_total(admin["id"]))["orders_count"] == 0
+    exported = await db.export_orders()
+    assert len(exported) == 1 and exported[0]["cancelled_at"] is not None
+
+
+async def test_deleted_owner_leaves_admins_working(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    async with db.write() as tx:
+        await db.delete_user(tx, owner["id"])
+    await make_order(db, admin, price=300)
+    assert (await db.admin_unpaid_total(admin["id"]))["due_sum"] == 50.0
+
+
+async def test_vrheaven_remainder_covers_orders_with_any_open_side(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)          # 300 − 50 − 90 = 160
+    async with db.write() as tx:
+        await db.create_payout(tx, admin)                  # доля админа закрыта
+    total = await db.vrheaven_unpaid_total()
+    assert total["orders_count"] == 1 and total["share_sum"] == 160.0
+    async with db.write() as tx:
+        await db.create_payout(tx, owner)
+    assert (await db.vrheaven_unpaid_total())["orders_count"] == 0
+
+
+async def test_unpayable_share_of_a_deleted_beneficiary_stays_with_vrheaven(db):
+    """Доля удалённого получателя не будет выплачена никогда — значит,
+    она остаётся у VR Heaven, а не исчезает из отчёта."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        await db.delete_user(tx, owner["id"])
+    total = await db.vrheaven_unpaid_total()
+    assert total["orders_count"] == 1
+    assert total["share_sum"] == 250.0                     # 300 − 50
+
+
+async def test_settings_defaults_and_overrides(db):
+    settings = await db.get_settings()
+    assert settings["price_1_30"] == SETTINGS_DEFAULTS["price_1_30"]
+    async with db.write() as tx:
+        await db.set_setting(tx, "price_1_30", 350)
+    assert (await db.get_settings())["price_1_30"] == 350
+
+
+async def test_admin_today_total_ignores_cancelled(db):
+    admin = await create_admin(db)
+    await make_order(db, admin, price=300)
+    cancelled = await make_order(db, admin, price=500, series_pos=2)
+    async with db.write() as tx:
+        await db.cancel_order(tx, cancelled, for_self=False)
+    today = await db.admin_today_total(admin["id"], "2000-01-01T00:00:00+00:00")
+    assert today["orders_count"] == 1 and today["turnover"] == 300
+
+
+async def test_owner_admins_summary_aggregates_current_period(db):
+    owner = await create_owner(db)
+    first = await create_admin(db, owner, "a1")
+    second = await create_admin(db, owner, "a2")
+    await make_order(db, first, owner, price=300)
+    await make_order(db, first, owner, price=500, series_pos=2)
+    rows = {r["handle"]: r for r in await db.owner_admins_summary(owner["id"])}
+    assert rows["a1"]["orders_count"] == 2 and rows["a1"]["turnover"] == 800
+    assert rows["a2"]["orders_count"] == 0
+    assert second["handle"] in rows

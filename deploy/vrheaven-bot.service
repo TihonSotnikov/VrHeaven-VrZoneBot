@@ -1,0 +1,41 @@
+# Юнит лежит в репозитории и ставится скриптом развёртывания: описание
+# и реальность не могут разойтись.
+[Unit]
+Description=VR Heaven revenue bot (admins)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vrheaven
+Group=vrheaven
+WorkingDirectory=/opt/vrheaven-bot/current
+ExecStart=/opt/vrheaven-bot/current/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/vrheaven-bot/env
+# Токен не лежит в окружении процесса: systemd кладёт его в файл,
+# доступный только этому юниту
+LoadCredential=bot_token:/etc/vrheaven-bot/bot_token
+Restart=always
+RestartSec=5
+
+# Процессу нужны один файл SQLite и исходящий HTTPS — всё остальное закрыто
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/opt/vrheaven-bot/data
+
+[Install]
+WantedBy=multi-user.target

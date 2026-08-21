@@ -1,0 +1,36 @@
+[project]
+name = "tgbot-for-admins"
+version = "1.0.0"
+description = "Telegram-бот учёта выручки VR-зоны: заказы VR-сеансов, доли владельцев и администраторов, выплаты"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.29,<4",
+    "aiosqlite>=0.20,<1",
+    "apscheduler>=3.10,<4",
+    "python-dotenv>=1.0,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 92
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]   # кириллица в строках и комментариях
+
+[tool.ruff.lint.per-file-ignores]
+# В тестах распаковка вида `owner, admin = ...` читается лучше подчёркиваний
+"tests/*" = ["E402", "RUF059"]
