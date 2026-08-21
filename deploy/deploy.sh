@@ -16,6 +16,9 @@ SERVICE=vrheaven-bot
 SERVICE_USER=vrheaven
 RELEASE="$APP_DIR/releases/$TAG"
 UV=$(command -v uv || echo /root/.local/bin/uv)
+# Интерпретатор — из общего каталога: venv, указывающий на /root, сервис
+# запустить не сможет (ни прав, ни доступа при ProtectHome=true)
+export UV_PYTHON_INSTALL_DIR=/opt/vrheaven-python
 
 echo "== выкладываем $TAG =="
 rm -rf "$RELEASE"
@@ -25,6 +28,12 @@ git --git-dir="$APP_DIR/repo.git" --work-tree="$RELEASE" checkout -f "$TAG"
 echo "== зависимости =="
 cd "$RELEASE"
 "$UV" sync --frozen --no-dev
+PYTHON_HOME=$(sed -n "s/^home = //p" "$RELEASE/.venv/pyvenv.cfg")
+case "$PYTHON_HOME" in
+    /opt/*) ;;
+    *) echo "venv смотрит на интерпретатор вне /opt ($PYTHON_HOME):" \
+            "сервис его не запустит" >&2; exit 1 ;;
+esac
 
 echo "== репетиция миграций на копии боевой базы =="
 if [ -f "$APP_DIR/data/adminbot.db" ]; then
