@@ -115,15 +115,28 @@ async def test_reanchor_failure_keeps_old_window(db, ui, bot):
     assert bot.deleted == []
 
 
-async def test_legacy_window_without_payload_is_removed_not_resent(db, ui, bot):
-    """Окна, доставшиеся от прежней версии, содержимого не имеют: их
-    убирают, а не воспроизводят пустым сообщением."""
+async def test_legacy_window_is_disarmed_not_deleted(db, ui, bot):
+    """Окно от прежней версии бота не удаляется: под ним может лежать
+    документ резервной копии. У него снимаются кнопки."""
     async with db.write() as tx:
         await db.save_window(tx, CHAT, 321, text="", markup_json=None, rich=False)
     await ui.reanchor(CHAT)
-    assert (CHAT, 321) in bot.deleted
+    assert bot.deleted == []
+    assert bot.markup_edits == [(CHAT, 321, None)]
     assert await db.get_window(CHAT) is None
     assert bot.sent == []
+
+
+async def test_legacy_window_is_not_deleted_when_the_screen_changes(db, ui, bot):
+    """Тот же запрет на пути обычной отрисовки: нередактируемый документ
+    заменяется новым Окном, но сам остаётся в чате."""
+    async with db.write() as tx:
+        await db.save_window(tx, CHAT, 321, text="", markup_json=None, rich=False)
+    bot.edit_error = "Bad Request: there is no text in the message to edit"
+    await ui.window(CHAT, "меню", kb.to_staff_menu_kb())
+    assert bot.deleted == []
+    assert bot.markup_edits == [(CHAT, 321, None)]
+    assert (await db.get_window(CHAT))["message_id"] == bot.sent[-1][1]
 
 
 async def test_document_record_is_sent_with_caption(db, ui, bot):

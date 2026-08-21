@@ -106,6 +106,7 @@ class FakeBot:
         self.last_rich = None
         self._next_id = 1000
         self.answers: list[str | None] = []
+        self.markup_edits = []
         self.other_calls: list[str] = []
         # Живые сообщения чата: (chat_id, message_id) -> {text, markup}
         self.live: dict[tuple[int, int], dict] = {}
@@ -181,6 +182,15 @@ class FakeBot:
         self.last_markup = reply_markup
         if rich_message is not None:
             self.last_rich = rich_message
+
+    async def edit_message_reply_markup(self, chat_id=None, message_id=None,
+                                       reply_markup=None, **kwargs):
+        validate_markup(reply_markup, where=f"editMessageReplyMarkup({chat_id})")
+        self.markup_edits.append((chat_id, message_id, reply_markup))
+        live = self.live.get((chat_id, message_id))
+        if live is not None:
+            live["markup"] = reply_markup
+        return True
 
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))

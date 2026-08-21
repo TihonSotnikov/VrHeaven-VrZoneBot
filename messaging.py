@@ -167,7 +167,25 @@ class Messenger:
             message = await self._send(chat_id, text, markup, rich)
         await self._store(chat_id, message.message_id, text, markup_json, rich)
         if current is not None and current["message_id"] != message.message_id:
-            await self._delete(chat_id, current["message_id"])
+            await self._retire(chat_id, current)
+
+    async def _retire(self, chat_id: int, row) -> None:
+        """Убирает прежнее Окно.
+
+        Окно, доставшееся от прежней версии бота, содержимого не имеет —
+        а под ним вполне может лежать документ резервной копии: прежняя
+        модель делала окном чата и его. Удалять такое нельзя, поэтому у
+        сообщения только снимаются кнопки, и оно остаётся Записью.
+        """
+        if row["text"]:
+            await self._delete(chat_id, row["message_id"])
+            return
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=row["message_id"], reply_markup=None)
+        except TelegramAPIError as e:
+            log.info("У прежнего окна %s чата %s не убрать кнопки: %s",
+                     row["message_id"], chat_id, e)
 
     async def _store(self, chat_id: int, message_id: int, text: str,
                      markup_json: str | None, rich: bool) -> None:
@@ -193,9 +211,10 @@ class Messenger:
             if current is None:
                 return
             if not current["text"]:
-                # Окно, доставшееся от прежней версии бота: содержимого нет,
-                # воспроизвести нечем — убираем, следующий экран станет новым
-                await self._delete(chat_id, current["message_id"])
+                # Окно от прежней версии бота: содержимого нет, воспроизвести
+                # нечем. Само сообщение не трогаем — под ним может быть
+                # документ копии; снимаем кнопки и забываем указатель
+                await self._retire(chat_id, current)
                 async with self.db.write() as tx:
                     await self.db.drop_window(tx, chat_id)
                 return
@@ -211,7 +230,7 @@ class Messenger:
                 return
             await self._store(chat_id, message.message_id, current["text"],
                               current["markup_json"], bool(current["is_rich"]))
-            await self._delete(chat_id, current["message_id"])
+            await self._retire(chat_id, current)
 
     # ------------------------------------------------------------- Записи
 
