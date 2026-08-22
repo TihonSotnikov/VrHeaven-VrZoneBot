@@ -48,7 +48,7 @@ def _all_callbacks() -> set[str]:
         kb.discount_days_kb(settings), kb.promos_kb(promos),
         kb.promo_card_kb(promos[0]), kb.bonuses_kb([_row(id=9)], 4),
         kb.super_admins_kb([(111, "111", True), (222, "222 · запасной", False)]),
-        kb.export_kb(), kb.export_kb(owner=True),
+        kb.export_kb(),
         kb.staff_admin_menu_kb(), kb.staff_owner_menu_kb(), kb.to_staff_menu_kb(),
         kb.order_kind_kb(promos), kb.headsets_kb(with_back=True),
         kb.duration_kb(1), kb.payment_kb("no:std"),

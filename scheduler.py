@@ -170,7 +170,7 @@ async def restore_check_job(db: Database, ui: Messenger, config: Config) -> None
                      dedup=f"restore_none:{utcnow().date()}")
         return
     newest = backups[-1]
-    problems, stats = await bk.verify_backup(newest.path, str(config.tz))
+    problems, stats = await bk.verify_backup(newest.path)
     if problems:
         await _alert(db, ui, config,
                      join("<b>Резервная копия не прошла проверку</b>",

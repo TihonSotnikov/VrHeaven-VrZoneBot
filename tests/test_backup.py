@@ -43,7 +43,7 @@ async def test_second_backup_of_the_day_does_not_overwrite_the_first(db, config)
 async def test_backup_contains_the_data(db, config):
     await _seed(db)
     info = await bk.create_backup(config, bk.REASON_MANUAL)
-    problems, stats = await bk.verify_backup(info.path, str(config.tz))
+    problems, stats = await bk.verify_backup(info.path)
     assert problems == []
     assert stats["users"] == 2 and stats["orders"] == 1
     assert stats["version"] >= 2
@@ -52,7 +52,7 @@ async def test_backup_contains_the_data(db, config):
 async def test_broken_snapshot_is_not_published(db, config, monkeypatch):
     """Копия, не прошедшая проверку, не появляется в каталоге вовсе."""
     await _seed(db)
-    monkeypatch.setattr(bk, "_verify_file", lambda path, tz: ["сломано"])
+    monkeypatch.setattr(bk, "_verify_file", lambda path: ["сломано"])
     with pytest.raises(RuntimeError, match="не прошла проверку"):
         await bk.create_backup(config, bk.REASON_DAILY)
     assert bk.list_backups(config.backup_dir) == []
@@ -133,5 +133,5 @@ async def test_invariant_failures_are_visible_in_verification(db, config):
     conn.execute("UPDATE orders SET owner_share = owner_share + 1")
     conn.commit()
     conn.close()
-    problems = bk._verify_file(raw, str(config.tz))
+    problems = bk._verify_file(raw)
     assert problems and "доля владельца" in problems[0]

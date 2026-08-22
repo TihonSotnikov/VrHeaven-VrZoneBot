@@ -227,7 +227,6 @@ class Database:
 
     async def enqueue_record(self, tx: Tx, *, chat_id: int, kind: str,
                              text: str, dedup_key: str | None = None,
-                             rich: bool = False,
                              document: dict | None = None) -> int | None:
         """Ставит Запись в очередь доставки внутри бизнес-транзакции.
 
@@ -235,8 +234,14 @@ class Database:
         откатился заказ — уведомлений нет; записался — уведомления
         гарантированно будут доставлены (с повторами через рестарты).
         Возвращает None, если такая Запись уже стоит в очереди.
+
+        Текст Записи хранится уже собранным, поэтому нативных таблиц
+        здесь не бывает: пересобрать их в запасной моноширинный вид при
+        отказе Telegram было бы нечем, а отправить `<table>` обычным
+        сообщением нельзя — разметку такого тега Telegram не понимает.
+        Отчёты кладутся в очередь моноширинными (`to_html(rich=False)`).
         """
-        payload = json.dumps({"text": text, "rich": rich, "document": document},
+        payload = json.dumps({"text": text, "document": document},
                              ensure_ascii=False)
         cur = await tx.execute(
             "INSERT INTO outbox (chat_id, kind, payload, dedup_key, status,"
@@ -475,6 +480,11 @@ class Database:
         1 и 1. Повторная отправка того же client_token (двойное нажатие,
         повтор callback, восстановление сценария после перезапуска) не
         создаёт второй заказ — возвращается уже записанный.
+
+        Граница серии (`series_since`) записывается в заказ вместе с местом
+        в ней: место без границы нельзя проверить, а выводить границу из
+        текущей настройки нельзя — смена времени сбросов перекроила бы
+        прошлые серии задним числом.
         """
         row = await tx.fetchone(
             "SELECT * FROM orders WHERE client_token = ?", (client_token,)
@@ -494,15 +504,15 @@ class Database:
         cur = await tx.execute(
             "INSERT INTO orders (client_token, admin_id, owner_id, kind, headsets,"
             " minutes, promo_id, promo_name, base_price, discount_percent, price,"
-            " admin_percent, admin_share, series_pos, owner_percent, owner_share,"
-            " owner_suspended, quoted_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " admin_percent, admin_share, series_pos, series_since, owner_percent,"
+            " owner_share, owner_suspended, quoted_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             # предикат обязателен: индекс частичный (NULL-токены исторических
             # заказов в него не входят)
             " ON CONFLICT(client_token) WHERE client_token IS NOT NULL DO NOTHING",
             (client_token, admin_id, owner_id, kind, headsets, minutes,
              promo_id, promo_name, base_price, discount_percent, price,
-             admin_percent, admin_share, series_pos,
+             admin_percent, admin_share, series_pos, series_since_iso,
              0 if owner_suspended else owner_percent, owner_share,
              int(owner_suspended), quoted_at, utcnow_iso()),
         )
@@ -622,6 +632,24 @@ class Database:
             (owner_id,),
         )
 
+    @staticmethod
+    def is_payable(total) -> bool:
+        """Есть ли что закрывать выплатой по агрегату текущего периода.
+
+        Нулевое накопление выплате не подлежит (SPEC §4), но ноль бывает
+        двух видов. Не начислено ничего — платить нечего. Начислено, а
+        потом удержано ровно столько же — строки настоящие, и период
+        обязан закрываться: иначе заказ и удержание остаются открытыми
+        навсегда и тянутся в каждый следующий период.
+
+        Отрицательный итог не выплачивается никогда: удержание, которое
+        больше начисленного, переносится в следующий период.
+        """
+        due = round(total["due_sum"], 2)
+        if due:
+            return due > 0
+        return bool(round(total["share_sum"], 2) or round(total["bonus_sum"], 2))
+
     async def unpaid_total(self, user: aiosqlite.Row) -> aiosqlite.Row:
         """Текущий период получателя — агрегат по его невыплаченной доле
         (у администратора итог due_sum включает невыплаченные бонусы)."""
@@ -683,26 +711,33 @@ class Database:
         """Остаток VR Heaven по заказам текущего периода сводки.
 
         Заказ открыт, пока не выплачена доля хотя бы одного получателя —
-        ровно те заказы, что видны в таблицах сводки. Доля удалённого
-        получателя не будет выплачена никогда, поэтому она остаётся у
-        VR Heaven: для таких заказов она прибавляется к остатку.
+        ровно те заказы, что видны в таблицах сводки. Удаление получателя
+        заказ не закрывает: его доля никуда не денется, просто достанется
+        VR Heaven, и она обязана остаться видимой (SPEC §4).
+
+        Доля уходит из остатка, если она **уже выплачена** или **будет
+        выплачена** (получатель не удалён). У VR Heaven она остаётся ровно
+        в одном случае: доля не выплачена, а получателя больше нет.
+        Условие по `deleted_at` без оглядки на выплату приписывало
+        VR Heaven деньги, которые он уже отдал.
         """
         return await self.fetchone(
             "SELECT COUNT(*) AS orders_count,"
             " COALESCE(SUM(o.price), 0) AS turnover,"
             " COALESCE(SUM("
             "   o.price"
-            "   - CASE WHEN a.deleted_at IS NULL THEN o.admin_share ELSE 0 END"
-            "   - CASE WHEN o.owner_id IS NOT NULL AND w.deleted_at IS NULL"
+            "   - CASE WHEN o.admin_payout_id IS NOT NULL OR a.deleted_at IS NULL"
+            "          THEN o.admin_share ELSE 0 END"
+            "   - CASE WHEN o.owner_id IS NULL THEN 0"
+            "          WHEN o.owner_payout_id IS NOT NULL OR w.deleted_at IS NULL"
             "          THEN o.owner_share ELSE 0 END"
             " ), 0) AS share_sum"
             " FROM orders o"
             " JOIN users a ON a.id = o.admin_id"
             " LEFT JOIN users w ON w.id = o.owner_id"
             " WHERE o.cancelled_at IS NULL"
-            " AND ((o.admin_payout_id IS NULL AND a.deleted_at IS NULL)"
-            "  OR (o.owner_id IS NOT NULL AND o.owner_payout_id IS NULL"
-            "      AND w.deleted_at IS NULL))"
+            " AND (o.admin_payout_id IS NULL"
+            "  OR (o.owner_id IS NOT NULL AND o.owner_payout_id IS NULL))"
         )
 
     async def owner_admins_summary(self, owner_id: int) -> list[aiosqlite.Row]:

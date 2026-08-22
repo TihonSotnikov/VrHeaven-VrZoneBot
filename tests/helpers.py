@@ -289,15 +289,34 @@ async def create_admin(db, owner=None, handle="adm1", *, password="secret",
     return await db.get_user(uid)
 
 
+def series_since_for(created_iso: str) -> str:
+    """Граница серии для заказа теста — та же, что записал бы бот.
+
+    Заказ несёт свою границу (`series_since`), поэтому её нельзя не
+    задать: без неё заказ выглядит наследием прежней схемы. Считаем по
+    умолчанию (сбросы 09:00 и 21:00) в UTC — детерминированно и ровно
+    теми же 12-часовыми окнами, что проверяет invariants.
+    """
+    from datetime import UTC, datetime
+
+    from pricing import normalize_reset, series_start
+    created = datetime.fromisoformat(created_iso)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    start = series_start(normalize_reset(None), created.astimezone(UTC))
+    return start.astimezone(UTC).isoformat(timespec="seconds")
+
+
 async def make_order(db, admin, owner=None, *, price=300.0, kind="standard",
                      headsets=1, minutes=30, discount=0.0, base=None,
                      admin_share=None, series_pos=1, owner_percent=None,
-                     promo_id=None, promo_name=None, created_at=None):
+                     promo_id=None, promo_name=None, created_at=None,
+                     series_since=...):
     """Заказ с явно заданными начислениями — для проверок расчётов.
 
     Боевое оформление идёт через db.create_order (лесенка считается там);
     здесь доли задаются прямо, чтобы проверять выплаты и отчёты на любых
-    числах, включая исторические заказы прежней схемы.
+    числах. series_since=None даёт заказ прежней схемы, без границы серии.
     """
     from pricing import ladder_amount
     from utils import utcnow_iso
@@ -306,16 +325,20 @@ async def make_order(db, admin, owner=None, *, price=300.0, kind="standard",
     if admin_share is None:
         admin_share = ladder_amount(series_pos) if series_pos else 0.0
     owner_share = round(price * percent / 100, 2) if owner else 0.0
+    created_at = created_at or utcnow_iso()
+    if series_since is ...:
+        series_since = series_since_for(created_at) if series_pos else None
     async with db.write() as tx:
         cur = await tx.execute(
             "INSERT INTO orders (admin_id, owner_id, kind, headsets, minutes,"
             " promo_id, promo_name, base_price, discount_percent, price,"
-            " admin_percent, admin_share, series_pos, owner_percent, owner_share,"
-            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " admin_percent, admin_share, series_pos, series_since,"
+            " owner_percent, owner_share, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (admin["id"], owner["id"] if owner else None, kind, headsets, minutes,
              promo_id, promo_name, base if base is not None else price, discount,
-             price, 0, admin_share, series_pos, percent if owner else 0,
-             owner_share, created_at or utcnow_iso()),
+             price, 0, admin_share, series_pos, series_since,
+             percent if owner else 0, owner_share, created_at),
         )
         return cur.lastrowid
 

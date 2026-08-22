@@ -196,3 +196,74 @@ async def test_owner_admins_summary_aggregates_current_period(db):
     assert rows["a1"]["orders_count"] == 2 and rows["a1"]["turnover"] == 800
     assert rows["a2"]["orders_count"] == 0
     assert second["handle"] in rows
+
+
+# -------- Остаток VR Heaven: доля уходит, если выплачена или будет выплачена
+
+async def test_paid_share_leaves_the_remainder_even_if_the_recipient_is_deleted(db):
+    """Удаление получателя не возвращает VR Heaven деньги, которые он
+    уже отдал: доля выплачена — значит, её в остатке нет."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)      # 300 − 50 − 90 = 160
+    async with db.write() as tx:
+        await db.create_payout(tx, admin)              # 50 ₽ реально выплачены
+        await db.delete_user(tx, admin["id"])
+    total = await db.vrheaven_unpaid_total()
+    assert total["orders_count"] == 1
+    assert cents(total["share_sum"]) == cents(160)
+
+
+async def test_unpaid_share_of_a_deleted_direct_admin_stays_visible(db):
+    """У прямого администратора владельца нет: если его долю списать
+    вместе с ним, заказ исчезал из сводки целиком, вместе с остатком."""
+    admin = await create_admin(db)                     # без владельца
+    await make_order(db, admin, price=300)
+    async with db.write() as tx:
+        await db.delete_user(tx, admin["id"])
+    total = await db.vrheaven_unpaid_total()
+    assert total["orders_count"] == 1
+    assert cents(total["share_sum"]) == cents(300)     # платить некому — всё у VR Heaven
+
+
+async def test_fully_paid_order_leaves_the_summary(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        await db.create_payout(tx, admin)
+        await db.create_payout(tx, owner)
+    assert (await db.vrheaven_unpaid_total())["orders_count"] == 0
+
+
+async def test_settlement_is_offered_when_bonus_cancels_the_share(db):
+    """Доля 250 и удержание −250 дают ноль, но строки настоящие: без
+    выплаты они остаются открытыми навсегда."""
+    admin = await create_admin(db)
+    await make_order(db, admin, price=1000, series_pos=5)     # доля 250
+    async with db.write() as tx:
+        await db.create_bonus(tx, admin["id"], -250.0, "удержание")
+    total = await db.admin_unpaid_total(admin["id"])
+    assert cents(total["due_sum"]) == cents(0)
+    assert db.is_payable(total)
+    async with db.write() as tx:
+        result = await db.create_payout(tx, admin)
+    assert result is not None and cents(result[1]) == cents(0)
+    assert not db.is_payable(await db.admin_unpaid_total(admin["id"]))
+
+
+async def test_nothing_accrued_is_still_not_payable(db):
+    admin = await create_admin(db)
+    owner = await create_owner(db)
+    assert not db.is_payable(await db.admin_unpaid_total(admin["id"]))
+    assert not db.is_payable(await db.owner_unpaid_total(owner["id"]))
+
+
+async def test_net_withholding_is_carried_forward_not_paid(db):
+    """Удержание больше начисленного не выплачивается: минус переносится."""
+    admin = await create_admin(db)
+    async with db.write() as tx:
+        await db.create_bonus(tx, admin["id"], -300.0, "удержание")
+    total = await db.admin_unpaid_total(admin["id"])
+    assert cents(total["due_sum"]) == cents(-300)
+    assert not db.is_payable(total)

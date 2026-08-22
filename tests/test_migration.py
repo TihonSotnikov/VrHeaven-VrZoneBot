@@ -286,7 +286,7 @@ async def test_pre_migration_snapshot_is_taken_before_any_change(tmp_path):
     db = Database(path)
     await db.init(before_migration=snapshot)
     try:
-        assert seen["versions"] == [1, 2]
+        assert seen["versions"] == list(range(1, LATEST_VERSION + 1))
         assert "audit_log" not in seen["tables_before"]
     finally:
         await db.close()
@@ -306,3 +306,39 @@ async def test_no_pending_migrations_skips_the_snapshot(tmp_path):
         assert await pending_migrations(db.conn) == []
     finally:
         await db.close()
+
+
+async def test_v3_adds_the_series_boundary_and_keeps_every_order(tmp_path):
+    """Миграция v3 добавляет колонку, ничего не переписывая: у заказов
+    прежней схемы граница остаётся пустой, и это правильный ответ —
+    восстановить её нечем."""
+    path = str(tmp_path / "legacy.db")
+    _legacy_db(path)
+    conn = sqlite3.connect(path)
+    before = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    conn.close()
+
+    db = Database(path)
+    await db.init()
+    try:
+        assert await db.schema_version() == LATEST_VERSION
+        rows = await db.fetchall("SELECT id, series_since FROM orders")
+        assert len(rows) == before
+        assert all(r["series_since"] is None for r in rows)
+        columns = {r[1] for r in await db.fetchall("PRAGMA table_info(orders)")}
+        assert "series_since" in columns
+    finally:
+        await db.close()
+
+
+async def test_v3_is_idempotent_across_restarts(tmp_path):
+    path = str(tmp_path / "again.db")
+    for _ in range(3):
+        db = Database(path)
+        await db.init()
+        assert await db.schema_version() == LATEST_VERSION
+        await db.close()
+    conn = sqlite3.connect(path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
+    conn.close()
+    assert columns.count("series_since") == 1

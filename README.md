@@ -32,7 +32,7 @@ logs.py          журналирование с контекстом
 roster.py        список супер-админов
 handlers/        сценарии: common (общее), vrheaven (панель), staff (кабинеты)
 guides/          инструкции «Как пользоваться» для каждой роли
-deploy/          юнит systemd, скрипты развёртывания и отката, runbook
+deploy/          юнит systemd, развёртывание, откат, их стенд, runbook
 tests/           тесты
 ```
 
@@ -93,7 +93,7 @@ Telegram отверг бы, роняет тест в месте отправки
 Проверка деловых инвариантов запускается и отдельно, над любым файлом базы:
 
 ```bash
-uv run python invariants.py /путь/к/adminbot.db Asia/Novosibirsk
+uv run python invariants.py /путь/к/adminbot.db
 ```
 
 ## Настройки окружения

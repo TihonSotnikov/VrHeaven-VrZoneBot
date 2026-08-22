@@ -122,3 +122,30 @@ def test_contract_validator_catches_real_failures():
 
 def test_escaped_ampersand_passes_validator():
     validate_html(esc("Игры & развлечения"))
+
+
+# ------------------- Отчёт укладывается в лимит, сохраняя итоги
+
+def _bulky_report() -> Report:
+    report = Report("Сводка за текущий период")
+    report.add(Table(["Логин", "Заказы", "Оборот", "К выплате"],
+                     [[f"administrator{i:03d}", i, "1 234 567", "250"]
+                      for i in range(200)]))
+    return report.add("<b>Остаток VR Heaven: 1 000 ₽</b>")
+
+
+@pytest.mark.parametrize("rich", [True, False])
+def test_report_fits_the_limit_and_keeps_its_totals(rich):
+    """Обрезка идёт по строкам таблицы, а не с конца: ради итоговой
+    строки отчёт и открывают."""
+    html = _bulky_report().to_html(rich=rich)
+    assert len(html) <= TEXT_LIMIT
+    assert "Остаток VR Heaven: 1 000 ₽" in html
+    validate_html(html)
+
+
+@pytest.mark.parametrize("rich", [True, False])
+def test_short_report_is_untouched(rich):
+    report = Report("Сводка").add(Table(["a"], [["b"]])).add("итого")
+    html = report.to_html(rich=rich)
+    assert len(html) < TEXT_LIMIT and "…" not in html

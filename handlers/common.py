@@ -30,11 +30,23 @@ GUIDE_TITLES = {
 
 
 def guide_bytes(config: Config, role: str) -> tuple[str, str, bytes]:
-    """Файл инструкции для роли: (заголовок, имя файла, содержимое)."""
+    """Файл инструкции для роли: (заголовок, имя файла, содержимое).
+
+    Содержимое отдаётся с подписью UTF-8 (BOM). Причина не косметическая:
+    Bot API не передаёт кодировку вовсе — aiogram кладёт документ в форму
+    как `application/octet-stream`, без charset, и просмотрщик определяет
+    кодировку сам. Android по умолчанию читает UTF-8 и всё показывает
+    верно; iOS при отсутствии подписи падает на однобайтовую кодировку,
+    и «Как пользоваться» превращается в «ÐšÐ°Ðº Ð¿Ð¾Ð»ÑŒÐ·Ð¾Ð²Ð°Ñ‚ÑŒÑÑ».
+    Три байта подписи — единственный сигнал, который доезжает до
+    просмотрщика; ту же роль они играют в выгрузках CSV для Excel.
+    """
     title, filename = GUIDE_TITLES[role]
     path = os.path.join(config.guides_dir, f"{role}.md")
-    with open(path, "rb") as handle:
-        return title, filename, handle.read()
+    # utf-8-sig на чтении снимает подпись, если она уже есть в файле:
+    # двойного BOM не будет ни при каком состоянии guides/
+    with open(path, encoding="utf-8-sig") as handle:
+        return title, filename, handle.read().encode("utf-8-sig")
 
 
 def guide_caption(role: str) -> str:

@@ -389,6 +389,38 @@ async def _verify_v2(conn) -> None:
         raise RuntimeError("После миграции v2 осталась прежняя таблица windows")
 
 
+# ------------------------------------------- v3: граница серии в заказе
+#
+# Место в лесенке считается от момента последнего сброса 12-часовой серии.
+# Этот момент выводился из **текущей** настройки администратора, поэтому
+# смена времени сбросов задним числом перекраивала прошлые серии: заказы,
+# оформленные с разными ступенями, оказывались в одной серии, и проверка
+# инвариантов объявляла нарушением то, чего не было. Копия базы такой
+# проверки не проходит и не публикуется — одна безобидная настройка
+# останавливала резервное копирование.
+#
+# Граница серии — такой же факт момента оформления, как вознаграждение и
+# доля владельца, и хранится там же, в заказе. Заказы прежних версий
+# границы не имеют: восстановить её нечем, и проверка их пропускает.
+
+SCHEMA_V3 = [
+    "CREATE INDEX IF NOT EXISTS idx_orders_series"
+    " ON orders(admin_id, series_since)",
+]
+
+
+async def _apply_v3(conn) -> None:
+    if "series_since" not in await _columns(conn, "orders"):
+        await conn.execute("ALTER TABLE orders ADD COLUMN series_since TEXT")
+    for statement in SCHEMA_V3:
+        await conn.execute(statement)
+
+
+async def _verify_v3(conn) -> None:
+    if "series_since" not in await _columns(conn, "orders"):
+        raise RuntimeError("После миграции v3 в orders нет колонки series_since")
+
+
 # ------------------------------------------------------------------ Раннер
 
 @dataclass(frozen=True)
@@ -403,6 +435,7 @@ class Migration:
 MIGRATIONS: list[Migration] = [
     Migration(1, "базовая схема", _apply_v1, _verify_v1, rebuilds_tables=True),
     Migration(2, "надёжность: журнал, очередь, окно, состояние", _apply_v2, _verify_v2),
+    Migration(3, "граница серии хранится в заказе", _apply_v3, _verify_v3),
 ]
 
 LATEST_VERSION = max(m.version for m in MIGRATIONS)

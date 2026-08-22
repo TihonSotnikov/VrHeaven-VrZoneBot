@@ -148,7 +148,14 @@ class Report:
         self.blocks.append(block)
         return self
 
-    def to_html(self, *, rich: bool) -> str:
+    def to_html(self, *, rich: bool, limit: int = TEXT_LIMIT) -> str:
+        """Отчёт одним сообщением, заведомо укладывающимся в лимит.
+
+        Длинный отчёт режется не с конца: в конце стоят итоги — «К выплате»
+        и «Остаток VR Heaven», ради которых отчёт и открывают. Обрезается
+        середина (строки таблиц), последний блок остаётся целым.
+        """
+        separator = "" if rich else "\n\n"
         parts = [f"<p><b>{esc(self.title)}</b></p>" if rich
                  else f"<b>{esc(self.title)}</b>"]
         for block in self.blocks:
@@ -158,7 +165,15 @@ class Report:
                 parts.append(f"<p>{block}</p>")
             else:
                 parts.append(block)
-        return ("" if rich else "\n\n").join(parts)
+        text = separator.join(parts)
+        if len(text) <= limit:
+            return text
+        tail = parts[-1]
+        head = separator.join(parts[:-1])
+        room = limit - len(tail) - len(separator)
+        if room <= len(TRUNCATION_MARKER):    # итоги сами длиннее лимита
+            return clamp(text, limit)
+        return clamp(head, room) + separator + tail
 
 
 def table_html(table: Table) -> str:

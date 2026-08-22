@@ -42,6 +42,9 @@ from markup import CAPTION_LIMIT, TEXT_LIMIT, Report, clamp
 
 log = logging.getLogger(__name__)
 
+# Верхняя граница словаря локов: см. chat_lock
+MAX_CHAT_LOCKS = 10_000
+
 
 def document_payload(filename: str, data: bytes) -> dict:
     """Готовый к постановке в очередь документ из байтов в памяти."""
@@ -77,21 +80,44 @@ class Messenger:
 
     def chat_lock(self, chat_id: int) -> asyncio.Lock:
         """Все операции с сообщениями одного чата строго последовательны:
-        две одновременные Записи не могут удалить одно и то же окно дважды."""
+        две одновременные Записи не могут удалить одно и то же окно дважды.
+
+        Лок заводится и на чат случайного прохожего (ответ на /start),
+        поэтому словарь ограничен сверху: при переполнении выбрасываются
+        свободные локи — никем не удерживаемый лок ничего не защищает.
+        Захваченные не трогаются никогда.
+        """
         lock = self._locks.get(chat_id)
         if lock is None:
+            if len(self._locks) >= MAX_CHAT_LOCKS:
+                for key, existing in list(self._locks.items()):
+                    if not existing.locked():
+                        del self._locks[key]
             lock = self._locks[chat_id] = asyncio.Lock()
         return lock
 
     # ------------------------------------------------------------- Рендер
 
     def render(self, content) -> tuple[str, bool]:
-        """Приводит содержимое к (html, нативная ли таблица)."""
+        """Приводит содержимое к (html, нативная ли таблица).
+
+        Длина ограничивается здесь, до отправки, — и для нативных таблиц
+        тоже. Сообщение, отвергнутое Telegram из-за собственного размера,
+        стоит дороже обрезанного: оно уносит экран и гасит нативные
+        таблицы на весь оставшийся срок жизни процесса.
+        """
         if isinstance(content, Report):
-            if self.rich_enabled:
-                return content.to_html(rich=True), True
-            return clamp(content.to_html(rich=False)), False
-        return clamp(str(content)), False
+            rich = self.rich_enabled
+            return self._fit(content.to_html(rich=rich), rich), rich
+        return self._fit(str(content), False), False
+
+    @staticmethod
+    def _fit(html: str, rich: bool) -> str:
+        text = clamp(html)
+        if len(text) != len(html):
+            log.error("Сообщение обрезано до лимита Telegram: было %s символов, "
+                      "стало %s (нативная таблица: %s)", len(html), len(text), rich)
+        return text
 
     def _demote_rich(self, error: Exception) -> None:
         self._rich_failures += 1
@@ -235,19 +261,16 @@ class Messenger:
     # ------------------------------------------------------------- Записи
 
     async def send_record(self, chat_id: int, payload: dict) -> int:
-        """Отправляет Запись — сообщение без кнопок, остающееся навсегда."""
+        """Отправляет Запись — сообщение без кнопок, остающееся навсегда.
+
+        Текст Записи собран заранее и всегда обычный: пересобрать
+        нативную таблицу в моноширинную при отказе Telegram было бы
+        нечем (см. db.enqueue_record).
+        """
         document = payload.get("document")
         if document:
             return await self._send_document(chat_id, payload, document)
-        text = clamp(payload["text"])
-        rich = bool(payload.get("rich")) and self.rich_enabled
-        try:
-            message = await self._send(chat_id, text, None, rich)
-        except TelegramBadRequest as e:
-            if not rich:
-                raise
-            self._demote_rich(e)
-            message = await self._send(chat_id, text, None, False)
+        message = await self._send(chat_id, clamp(payload["text"]), None, False)
         return message.message_id
 
     async def _send_document(self, chat_id: int, payload: dict, document: dict) -> int:

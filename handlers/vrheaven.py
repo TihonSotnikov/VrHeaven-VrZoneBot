@@ -1263,11 +1263,11 @@ async def payout_list(cb: CallbackQuery, state: FSMContext, db: Database,
     # накопление включает бонусы
     entries = []
     for r in await db.owners_unpaid_summary():
-        if r["due_sum"] > 0:
+        if db.is_payable(r):
             entries.append((r["id"], f"{r['handle']} · владелец"
                                      f" · {fmt_money(r['due_sum'])}"))
     for r in await db.admins_unpaid_summary():
-        if r["due_sum"] > 0:
+        if db.is_payable(r):
             entries.append((r["id"], f"{r['handle']} · администратор"
                                      f" · {fmt_money(r['due_sum'])}"))
     if not entries:
@@ -1291,7 +1291,7 @@ async def payout_pick(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
         await cb.answer("Получатель не найден", show_alert=True)
         return
     total = await db.unpaid_total(user)
-    if total["due_sum"] <= 0:
+    if not db.is_payable(total):
         await cb.answer("У получателя нет долей к выплате", show_alert=True)
         return
     bonus_line = ""
@@ -1779,6 +1779,14 @@ async def setting_set(message: Message, state: FSMContext, db: Database,
         return
     if key == "pc_bonus_points":
         value = round(value)
+        if value < 1:
+            await ui.window(
+                message.chat.id,
+                join(h("<b>{}</b>", SETTING_TITLES[key]),
+                     "Баллы — целое число не меньше 1",
+                     "Введите значение ещё раз"),
+                kb.cancel_kb(SETTING_SCREENS.get(key, "st:prices")))
+            return
     settings = await db.get_settings()
     old_value = settings[key]
     if key.startswith("price_") and old_value > 0 and (
@@ -1895,6 +1903,22 @@ async def super_admin_add(message: Message, state: FSMContext, db: Database,
                         join("<b>Новый супер-админ</b>",
                              h("{} уже в списке", tg_id)),
                         kb.back_kb("sa:menu", "К списку"))
+        return
+    # Супер-админ не бывает владельцем или администратором (SPEC §12.8):
+    # его чат уводится в панель VR Heaven, и кабинет перестанет
+    # открываться, а уведомления кабинета продолжат приходить
+    staff_user = await db.get_user_by_chat(tg_id)
+    if staff_user is not None:
+        await ui.window(
+            message.chat.id,
+            join("<b>Новый супер-админ</b>",
+                 h("{} — это кабинет «{}» ({}). Супер-админ не может быть "
+                   "владельцем или администратором",
+                   tg_id, staff_user["handle"],
+                   kb.ROLE_LABELS[staff_user["role"]]),
+                 "Сначала отвяжите устройство сменой пароля кабинета "
+                 "или укажите другой Telegram ID"),
+            kb.back_kb("sa:menu", "К списку"))
         return
     async with db.write() as tx:
         await db.add_super_admin(tx, tg_id, "", message.from_user.id)

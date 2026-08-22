@@ -421,3 +421,26 @@ async def test_users_list_paginates(db, ui):
     buttons = await button_texts(db, VR_CHAT)
     assert "‹ Назад" in buttons
     assert len([b for b in buttons if b.startswith("own")]) == 4
+
+
+async def test_super_admin_cannot_be_an_owner_or_an_administrator(db, ui, config):
+    """SPEC §12.8. Чат супер-админа уводится в панель VR Heaven, поэтому
+    кабинет за тем же чатом перестал бы открываться вовсе."""
+    admin = await create_admin(db, handle="adm1")
+    await bind(db, admin, 4242)
+    await set_window(db, VR_CHAT, WINDOW)
+    state = make_state(db, VR_CHAT)
+    await super_admin_add_ask(fake_cb("sa:add", chat_id=VR_CHAT, message_id=WINDOW),
+                              state, ui)
+    await super_admin_add(fake_msg("4242", chat_id=VR_CHAT), state, db, ui, config)
+    assert "adm1" in await window_text(db, VR_CHAT)
+    assert await db.list_super_admins() == []
+
+
+async def test_super_admin_add_still_works_for_a_free_id(db, ui, config):
+    await set_window(db, VR_CHAT, WINDOW)
+    state = make_state(db, VR_CHAT)
+    await super_admin_add_ask(fake_cb("sa:add", chat_id=VR_CHAT, message_id=WINDOW),
+                              state, ui)
+    await super_admin_add(fake_msg("4242", chat_id=VR_CHAT), state, db, ui, config)
+    assert [r["tg_id"] for r in await db.list_super_admins()] == [4242]

@@ -92,8 +92,8 @@ def _snapshot(db_path: str, target: str) -> None:
         conn.close()
 
 
-def _verify_file(path: str, tz_name: str) -> list[str]:
-    problems = check_database(path, tz_name)
+def _verify_file(path: str) -> list[str]:
+    problems = check_database(path)
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         tables = {row[0] for row in conn.execute(
@@ -106,7 +106,7 @@ def _verify_file(path: str, tz_name: str) -> list[str]:
     return problems
 
 
-def _create_sync(db_path: str, backup_dir: str, reason: str, tz_name: str) -> BackupInfo:
+def _create_sync(db_path: str, backup_dir: str, reason: str) -> BackupInfo:
     os.makedirs(backup_dir, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     final = os.path.join(backup_dir, f"{PREFIX}{stamp}-{reason}{SUFFIX}")
@@ -114,7 +114,7 @@ def _create_sync(db_path: str, backup_dir: str, reason: str, tz_name: str) -> Ba
     raw, packed = work + ".db", work + SUFFIX
     try:
         _snapshot(db_path, raw)
-        problems = _verify_file(raw, tz_name)
+        problems = _verify_file(raw)
         if problems:
             raise RuntimeError("копия не прошла проверку: " + "; ".join(problems[:5]))
         with open(raw, "rb") as src, gzip.open(packed, "wb", compresslevel=6) as dst:
@@ -135,7 +135,6 @@ async def create_backup(config: Config, reason: str, *,
     """Снимает проверенную копию базы. Ничего не удаляет до успеха."""
     info = await asyncio.to_thread(
         _create_sync, db_path or config.db_path, config.backup_dir, reason,
-        str(config.tz),
     )
     log.info("Резервная копия: %s (%.1f КБ)", info.name, info.size / 1024)
     await asyncio.to_thread(rotate, config)
@@ -186,12 +185,12 @@ def rotate(config: Config) -> list[str]:
     return removed
 
 
-def _verify_backup_sync(path: str, tz_name: str) -> tuple[list[str], dict]:
+def _verify_backup_sync(path: str) -> tuple[list[str], dict]:
     with tempfile.TemporaryDirectory() as tmp:
         restored = os.path.join(tmp, "restored.db")
         with gzip.open(path, "rb") as src, open(restored, "wb") as dst:
             shutil.copyfileobj(src, dst)
-        problems = _verify_file(restored, tz_name)
+        problems = _verify_file(restored)
         conn = sqlite3.connect(f"file:{restored}?mode=ro", uri=True)
         try:
             stats = {
@@ -205,10 +204,10 @@ def _verify_backup_sync(path: str, tz_name: str) -> tuple[list[str], dict]:
     return problems, stats
 
 
-async def verify_backup(path: str, tz_name: str) -> tuple[list[str], dict]:
+async def verify_backup(path: str) -> tuple[list[str], dict]:
     """Проверка восстановимости: копия распаковывается, открывается и
     проверяется инвариантами — «копии есть» превращается в «копии рабочие»."""
-    return await asyncio.to_thread(_verify_backup_sync, path, tz_name)
+    return await asyncio.to_thread(_verify_backup_sync, path)
 
 
 async def push_offhost(config: Config, info: BackupInfo) -> str | None:

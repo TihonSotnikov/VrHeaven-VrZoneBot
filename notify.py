@@ -15,31 +15,34 @@ from roster import super_admin_ids
 
 
 async def to_user(db: Database, tx: Tx, user, text: str, *, kind: str,
-                  dedup: str | None = None, rich: bool = False,
-                  document: dict | None = None) -> int:
-    """Запись во все чаты кабинета пользователя. Возвращает число чатов."""
-    chats = await db.chats_for_user(user["id"])
+                  dedup: str | None = None, document: dict | None = None,
+                  exclude_chat_id: int | None = None) -> int:
+    """Запись во все чаты кабинета пользователя. Возвращает число чатов.
+
+    exclude_chat_id — чат, который узнаёт новость иначе: тот, откуда
+    пришло действие, видит результат на собственном Окне. Остальные
+    устройства кабинета уведомляются как обычно.
+    """
+    chats = [c for c in await db.chats_for_user(user["id"]) if c != exclude_chat_id]
     for chat_id in chats:
         await db.enqueue_record(
-            tx, chat_id=chat_id, kind=kind, text=text, rich=rich,
-            document=document,
+            tx, chat_id=chat_id, kind=kind, text=text, document=document,
             dedup_key=f"{dedup}:chat:{chat_id}" if dedup else None,
         )
     return len(chats)
 
 
 async def to_chat(db: Database, tx: Tx, chat_id: int, text: str, *, kind: str,
-                  dedup: str | None = None, rich: bool = False,
-                  document: dict | None = None) -> None:
+                  dedup: str | None = None, document: dict | None = None) -> None:
     await db.enqueue_record(
-        tx, chat_id=chat_id, kind=kind, text=text, rich=rich, document=document,
+        tx, chat_id=chat_id, kind=kind, text=text, document=document,
         dedup_key=f"{dedup}:chat:{chat_id}" if dedup else None,
     )
 
 
 async def to_super_admins(db: Database, tx: Tx, config: Config, text: str, *,
                           kind: str, dedup: str | None = None,
-                          rich: bool = False, document: dict | None = None,
+                          document: dict | None = None,
                           exclude_tg_id: int | None = None) -> int:
     """Запись каждому супер-админу, кроме инициатора: он видит результат
     на собственном Окне и второй раз о нём читать не должен."""
@@ -48,7 +51,7 @@ async def to_super_admins(db: Database, tx: Tx, config: Config, text: str, *,
         if tg_id == exclude_tg_id:
             continue
         await db.enqueue_record(
-            tx, chat_id=tg_id, kind=kind, text=text, rich=rich, document=document,
+            tx, chat_id=tg_id, kind=kind, text=text, document=document,
             dedup_key=f"{dedup}:chat:{tg_id}" if dedup else None,
         )
         sent += 1

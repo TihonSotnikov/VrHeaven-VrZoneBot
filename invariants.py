@@ -6,25 +6,36 @@
 разбора происшествий:
 
     python invariants.py /путь/к/adminbot.db
+
+Проверки не зависят ни от одной настройки: всё, что нужно для суждения о
+заказе, лежит в самом заказе. Часовой пояс здесь больше не нужен —
+граница серии хранится в заказе, а не выводится из текущего расписания
+сбросов (миграция v3).
 """
 
 import sqlite3
 import sys
-from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
 
-from pricing import SALARY_LADDER, ladder_amount, normalize_reset, series_start
+from pricing import SALARY_LADDER, ladder_amount
 
-DEFAULT_TZ = "Asia/Novosibirsk"
+# Копейка в двоичной дроби точно не представима: 0.1 + 0.2 != 0.3.
+# Допуск на порядки меньше копейки — расхождение сверх него означает,
+# что сумма записана не по правилам округления, а не что float дрогнул.
+CENT_EPSILON = 1e-6
 
 
 def _cents(value: float) -> int:
     return round(float(value) * 100)
 
 
-def check_database(path: str, tz_name: str = DEFAULT_TZ) -> list[str]:
+def _not_whole_cents(value) -> bool:
+    """Сумма не кратна копейке — деньги записаны мимо дисциплины округления."""
+    scaled = float(value) * 100
+    return abs(scaled - round(scaled)) > CENT_EPSILON
+
+
+def check_database(path: str) -> list[str]:
     """Возвращает список нарушений; пустой список — всё сходится."""
-    tz = ZoneInfo(tz_name)
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -33,7 +44,7 @@ def check_database(path: str, tz_name: str = DEFAULT_TZ) -> list[str]:
         problems += _check_order_shares(conn)
         problems += _check_payouts(conn)
         problems += _check_uniqueness(conn)
-        problems += _check_series(conn, tz)
+        problems += _check_series(conn)
         return problems
     finally:
         conn.close()
@@ -63,9 +74,10 @@ def _check_order_shares(conn) -> list[str]:
         " owner_id FROM orders"
     ):
         for field in ("price", "admin_share", "owner_share"):
-            value = row[field]
-            if _cents(value) != round(float(value) * 100):
-                problems.append(f"заказ №{row['id']}: {field} не кратно копейке")
+            if _not_whole_cents(row[field]):
+                problems.append(
+                    f"заказ №{row['id']}: {field} = {row[field]} не кратно копейке"
+                )
         expected_owner = round(float(row["price"]) * float(row["owner_percent"]) / 100, 2)
         if _cents(row["owner_share"]) != _cents(expected_owner):
             problems.append(
@@ -90,6 +102,14 @@ def _check_order_shares(conn) -> list[str]:
 def _check_payouts(conn) -> list[str]:
     """Сумма выплаты обязана сходиться с тем, что она закрыла."""
     problems = []
+    for row in conn.execute("SELECT id, amount FROM bonuses"):
+        if _not_whole_cents(row["amount"]):
+            problems.append(
+                f"бонус №{row['id']}: сумма {row['amount']} не кратна копейке")
+    for row in conn.execute("SELECT id, amount FROM payouts"):
+        if _not_whole_cents(row["amount"]):
+            problems.append(
+                f"выплата №{row['id']}: сумма {row['amount']} не кратна копейке")
     for payout in conn.execute("SELECT p.*, u.role FROM payouts p"
                                " JOIN users u ON u.id = p.user_id"):
         share_col = "admin_share" if payout["role"] == "admin" else "owner_share"
@@ -143,30 +163,32 @@ def _check_uniqueness(conn) -> list[str]:
     return problems
 
 
-def _check_series(conn, tz) -> list[str]:
+def _check_series(conn) -> list[str]:
     """В одной 12-часовой серии администратора не бывает двух заказов
-    с одинаковым местом — иначе кто-то недополучил вознаграждение."""
+    с одинаковым местом — иначе кто-то недополучил вознаграждение.
+
+    Серия берётся из самого заказа (`series_since`), а не выводится из
+    текущего расписания сбросов: настройка меняется, прошлое — нет.
+    Заказы прежних версий границы не несут, восстановить её нечем, и
+    сравнивать их не с чем — они проверяются только по лесенке.
+    """
     problems = []
-    resets = {row["id"]: row["series_reset_min"]
-              for row in conn.execute("SELECT id, series_reset_min FROM users")}
-    seen: dict[tuple, int] = {}
-    for row in conn.execute(
-        "SELECT id, admin_id, series_pos, created_at FROM orders"
-        " WHERE cancelled_at IS NULL AND series_pos IS NOT NULL ORDER BY id"
-    ):
-        created = datetime.fromisoformat(row["created_at"])
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        start = series_start(normalize_reset(resets.get(row["admin_id"])),
-                             created.astimezone(tz))
-        key = (row["admin_id"], start.isoformat(), row["series_pos"])
-        if key in seen:
-            problems.append(
-                f"заказы №{seen[key]} и №{row['id']}: одно место"
-                f" {row['series_pos']} в одной серии"
-            )
-        else:
-            seen[key] = row["id"]
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+    if "series_since" in columns:
+        seen: dict[tuple, int] = {}
+        for row in conn.execute(
+            "SELECT id, admin_id, series_pos, series_since FROM orders"
+            " WHERE cancelled_at IS NULL AND series_pos IS NOT NULL"
+            " AND series_since IS NOT NULL ORDER BY id"
+        ):
+            key = (row["admin_id"], row["series_since"], row["series_pos"])
+            if key in seen:
+                problems.append(
+                    f"заказы №{seen[key]} и №{row['id']}: одно место"
+                    f" {row['series_pos']} в одной серии"
+                )
+            else:
+                seen[key] = row["id"]
     if SALARY_LADDER != (50.0, 100.0, 150.0, 200.0, 250.0):
         problems.append("лесенка вознаграждения отличается от описанной в SPEC")
     return problems
@@ -174,10 +196,15 @@ def _check_series(conn, tz) -> list[str]:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Использование: python invariants.py <файл базы> [часовой пояс]")
+        print("Использование: python invariants.py <файл базы>")
         return 2
-    tz_name = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_TZ
-    problems = check_database(sys.argv[1], tz_name)
+    if len(sys.argv) > 2:
+        # Прежние версии принимали часовой пояс вторым аргументом; он
+        # больше ни на что не влияет, но и ронять проверку из-за него
+        # посреди разбора происшествия незачем
+        print("Часовой пояс больше не нужен: проверки от него не зависят",
+              file=sys.stderr)
+    problems = check_database(sys.argv[1])
     if not problems:
         print("Инварианты выполнены: расхождений нет")
         return 0

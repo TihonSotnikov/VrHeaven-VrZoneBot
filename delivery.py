@@ -43,6 +43,12 @@ CHAT_RATE = 1.0           # запросов в секунду в один ча�
 CHAT_BURST = 5.0
 MAX_RETRIES = 3
 
+# Ведёрко заводится на каждый чат, а писать боту может кто угодно: без
+# верхней границы словарь растёт от каждого случайного /start и живёт до
+# перезапуска. Наполнившееся ведёрко ничего не ограничивает — его можно
+# выбросить и завести заново при следующем запросе.
+MAX_BUCKETS = 10_000
+
 
 class _Bucket:
     """Простое токенное ведро на монотонных часах."""
@@ -63,6 +69,28 @@ class _Bucket:
             return 0.0
         return (1 - self.tokens) / self.rate
 
+    def is_full(self, now: float) -> bool:
+        return self.tokens + (now - self.updated) * self.rate >= self.burst
+
+
+def _bucket_for(buckets: dict[int, _Bucket], key: int, rate: float,
+                burst: float) -> _Bucket:
+    """Ведёрко чата; на переполнении словаря выбрасывает наполнившиеся.
+
+    Ведёрко активного чата не трогается никогда: ограничение важнее
+    памяти. Если выбрасывать нечего, словарь растёт — но тогда его
+    размер и есть число чатов, которые прямо сейчас пишут боту.
+    """
+    bucket = buckets.get(key)
+    if bucket is None:
+        if len(buckets) >= MAX_BUCKETS:
+            now = time.monotonic()
+            for existing_key, existing in list(buckets.items()):
+                if existing.is_full(now):
+                    del buckets[existing_key]
+        bucket = buckets[key] = _Bucket(rate, burst)
+    return bucket
+
 
 class ThrottleMiddleware(BaseRequestMiddleware):
     def __init__(self, *, global_rate: float = GLOBAL_RATE,
@@ -77,9 +105,8 @@ class ThrottleMiddleware(BaseRequestMiddleware):
         async with self._lock:
             delay = self._global.take()
             if chat_id is not None:
-                bucket = self._chats.get(chat_id)
-                if bucket is None:
-                    bucket = self._chats[chat_id] = _Bucket(self._chat_rate, CHAT_BURST)
+                bucket = _bucket_for(self._chats, chat_id, self._chat_rate,
+                                     CHAT_BURST)
                 delay = max(delay, bucket.take())
         if delay > 0:
             await asyncio.sleep(delay)
@@ -123,9 +150,7 @@ class InboundThrottle(BaseMiddleware):
     async def __call__(self, handler, event, data):
         chat = data.get("event_chat")
         if chat is not None:
-            bucket = self._buckets.get(chat.id)
-            if bucket is None:
-                bucket = self._buckets[chat.id] = _Bucket(self._rate, self._burst)
+            bucket = _bucket_for(self._buckets, chat.id, self._rate, self._burst)
             if bucket.take() > 0:
                 log.warning("Поток из чата %s ограничен", chat.id)
                 callback = getattr(event, "callback_query", None)

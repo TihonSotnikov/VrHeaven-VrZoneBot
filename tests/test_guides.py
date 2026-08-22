@@ -77,3 +77,27 @@ def test_staff_menus_offer_support():
     for markup in (kb.staff_admin_menu_kb(), kb.staff_owner_menu_kb()):
         actions = {b.callback_data for row in markup.inline_keyboard for b in row}
         assert "help" in actions
+
+
+def test_guide_is_utf8_with_a_signature(config):
+    """Bot API не передаёт кодировку: aiogram кладёт документ в форму как
+    application/octet-stream, и просмотрщик угадывает её сам. Android
+    угадывает UTF-8, iOS — однобайтовую, и кириллица превращается в
+    «ÐšÐ°Ðº». Подпись UTF-8 — единственный сигнал, который доезжает."""
+    for role in ("superadmin", "owner", "admin"):
+        _, filename, data = guide_bytes(config, role)
+        assert filename.endswith(".md"), "инструкция остаётся Markdown"
+        assert data.startswith(b"\xef\xbb\xbf"), f"{role}: нет подписи UTF-8"
+        assert not data[3:].startswith(b"\xef\xbb\xbf"), f"{role}: подпись дважды"
+        text = data.decode("utf-8-sig")          # строго: невалидный UTF-8 упадёт
+        assert "Как" in text or "VR Heaven" in text
+        # Android и любой другой читатель без подписи видит тот же текст
+        assert data.decode("utf-8").lstrip("﻿") == text
+
+
+def test_guide_signature_survives_a_source_file_that_already_has_one(tmp_path, config):
+    """Двойного BOM не появится, в каком бы виде ни лежал файл в guides/."""
+    from dataclasses import replace
+    (tmp_path / "admin.md").write_text("﻿# Инструкция\n", encoding="utf-8")
+    _, _, data = guide_bytes(replace(config, guides_dir=str(tmp_path)), "admin")
+    assert data == "﻿# Инструкция\n".encode()

@@ -64,8 +64,11 @@ LOGIN_COOLDOWN_SECONDS = 300
 CANCEL_WINDOW = timedelta(minutes=15)
 
 # Пауза после серии неудачных попыток входа: перебирать пароль
-# бессмысленно и без неё, но поток попыток занимал бы бота
+# бессмысленно и без неё, но поток попыток занимал бы бота.
+# Словарь ограничен сверху: писать боту может кто угодно, а запись
+# с истёкшей паузой уже ничего не значит и выбрасывается.
 _login_block: dict[int, tuple[int, float]] = {}
+MAX_LOGIN_BLOCKS = 10_000
 
 
 class LoginSG(StatesGroup):
@@ -186,10 +189,20 @@ def _note_login_failure(chat_id: int) -> None:
     if until and until < time.time():
         failures = 0
     failures += 1
+    if chat_id not in _login_block and len(_login_block) >= MAX_LOGIN_BLOCKS:
+        _prune_login_blocks()
     _login_block[chat_id] = (
         failures,
         time.time() + LOGIN_COOLDOWN_SECONDS if failures >= MAX_LOGIN_ATTEMPTS else 0.0,
     )
+
+
+def _prune_login_blocks() -> None:
+    """Убирает записи, чья пауза уже истекла: они никого не держат."""
+    now = time.time()
+    for chat_id, (_, until) in list(_login_block.items()):
+        if until <= now:
+            del _login_block[chat_id]
 
 
 @router.message(LoginSG.password, F.text)
@@ -738,6 +751,7 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
         "Служба поддержки: {}",
         user["handle"], user["contact"] or "—", SUPPORT)
     owner_devices = 0
+    own_devices = 0
     async with db.write() as tx:
         # Условный UPDATE проверяет выплаты в самом запросе: выплата,
         # пришедшая в этот же миг, не может проскочить мимо запрета
@@ -748,6 +762,21 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
                            before={"cancelled": False},
                            after={"cancelled": True, "by": "admin",
                                   "price": order["price"]})
+            # Чек заказа ушёл на все устройства кабинета, значит и отмена
+            # обязана дойти до них: иначе на втором телефоне навсегда
+            # остаётся чек заказа, которого больше нет. Инициатор видит
+            # результат на своём Окне и второй раз о нём не читает
+            own_total = await db.admin_unpaid_total(user["id"])
+            own_devices = await notify.to_user(
+                db, tx, user,
+                join("<b>Заказ отменён</b>",
+                     h("Ваш заказ №{} на сумму {} исключён из расчёта долей\n"
+                       "Накоплено к выплате: {}",
+                       order_id, fmt_money(order["price"]),
+                       fmt_money(own_total["due_sum"])),
+                     cancelled_by),
+                kind="order_cancelled", dedup=f"cancel:{order_id}:admin",
+                exclude_chat_id=cb.message.chat.id)
             if order["owner_id"]:
                 owner = await db.get_user(order["owner_id"])
                 if owner and owner["deleted_at"] is None:
@@ -783,7 +812,9 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
         cb.message.chat.id,
         join(h("<b>Заказ №{} отменён</b>", order_id),
              h("Сумма {} исключена из всех расчётов", fmt_money(order["price"])),
-             notify.devices_note(owner_devices, "Владелец") if owner_devices else ""),
+             notify.devices_note(owner_devices, "Владелец") if owner_devices else "",
+             h("Ваши другие устройства уведомлены: {}", own_devices)
+             if own_devices else ""),
         kb.to_staff_menu_kb(), source_message_id=cb.message.message_id)
     await cb.answer("Заказ отменён")
 

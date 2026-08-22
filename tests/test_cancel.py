@@ -209,3 +209,23 @@ async def test_cancelled_order_frees_its_place_in_the_series(db, ui, config):
     orders = await db.export_orders()
     assert [o["series_pos"] for o in orders] == [1, 2, 2]
     assert [o["admin_share"] for o in orders] == [50.0, 100.0, 100.0]
+
+
+async def test_self_cancel_reaches_the_other_devices_of_the_admin(db, ui, config,
+                                                                  bot, worker):
+    """Чек заказа ушёл на все устройства кабинета — отмена обязана дойти
+    туда же, иначе на втором телефоне навсегда остаётся чек заказа,
+    которого больше нет. Инициатор видит результат на своём Окне."""
+    SECOND = 777
+    owner, admin = await _club(db)
+    await bind(db, admin, SECOND)
+    await set_window(db, SECOND, WINDOW)
+    order_id = await make_order(db, admin, owner, price=300)
+    await cancel_confirm(fake_cb(f"sc:ok:{order_id}", chat_id=ADMIN_CHAT,
+                                 message_id=WINDOW),
+                         make_state(db, ADMIN_CHAT), db, ui, config)
+    await drain(worker)
+    second = bot.records(SECOND)
+    assert second and "Заказ отменён" in second[0]
+    assert "Заказ отменил администратор" in second[0]
+    assert bot.records(ADMIN_CHAT) == [], "инициатор видит результат на Окне"

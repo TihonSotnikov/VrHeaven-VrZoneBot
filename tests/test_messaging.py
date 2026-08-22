@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest
 from helpers import set_window, window_text
 
 import keyboards as kb
-from markup import Report, Table
+from markup import TEXT_LIMIT, Report, Table
 from messaging import document_payload
 
 CHAT = 1
@@ -189,3 +189,26 @@ async def test_only_the_window_carries_buttons(db, ui, bot):
     interactive = bot.interactive(CHAT)
     assert len(interactive) == 1
     assert interactive[0] == (await db.get_window(CHAT))["message_id"]
+
+
+async def test_oversized_rich_report_is_trimmed_before_sending(db, ui, bot):
+    """Нативная таблица длиннее лимита раньше уходила в Telegram как есть:
+    отправка отклонялась, экран терялся, таблицы гасли до перезапуска."""
+    report = Report("Моя статистика")
+    report.add(Table(["Дата", "Заказ", "Сумма", "Доля"],
+                     [["21.08 14:30", "2 шлема · 60 мин", "800", "250"]
+                      for _ in range(400)]))
+    report.add("<b>К выплате: 100 000 ₽</b>")
+    assert len(report.to_html(rich=True, limit=10 ** 9)) > TEXT_LIMIT
+
+    await ui.window(CHAT, report, kb.to_staff_menu_kb())
+    assert ui.rich_enabled is True, "нативные таблицы гасить не пришлось"
+    assert len(bot.rich_sent) == 1
+    html = bot.rich_sent[0][2]
+    assert len(html) <= TEXT_LIMIT
+    assert "К выплате: 100 000 ₽" in html
+
+
+async def test_oversized_plain_text_is_trimmed_before_sending(db, ui, bot):
+    await ui.window(CHAT, "<b>" + "щ" * 9000 + "</b>", kb.to_staff_menu_kb())
+    assert len(bot.sent[0][2]) <= TEXT_LIMIT

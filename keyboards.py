@@ -46,11 +46,11 @@ def back_kb(cb: str, text: str = "Назад") -> InlineKeyboardMarkup:
 
 
 def _paging(kb: InlineKeyboardBuilder, *, prev_cb: str | None,
-            next_cb: str | None) -> int:
+            next_cb: str | None, prev_text: str = "‹ Назад") -> int:
     """Кнопки листания; возвращает их число для раскладки."""
     count = 0
     if prev_cb:
-        kb.button(text="‹ Назад", callback_data=prev_cb)
+        kb.button(text=prev_text, callback_data=prev_cb)
         count += 1
     if next_cb:
         kb.button(text="Дальше ›", callback_data=next_cb)
@@ -94,7 +94,10 @@ def orders_pick_kb(orders, tz, *, prev_cb: str | None = None,
                  f" · {fmt_dt(o['created_at'], tz, '%d.%m')}{paid}",
             callback_data=f"ac:o:{o['id']}",
         )
-    paging = _paging(kb, prev_cb=prev_cb, next_cb=next_cb)
+    # Листание по курсору идёт только вперёд, поэтому подпись честная:
+    # кнопка возвращает к началу списка, а не на предыдущую страницу
+    paging = _paging(kb, prev_cb=prev_cb, next_cb=next_cb,
+                     prev_text="‹ В начало")
     kb.button(text="Найти заказ по номеру", callback_data="ac:find")
     kb.button(text="В меню", callback_data="am")
     kb.adjust(*([1] * len(orders) + ([paging] if paging else []) + [1, 1]))
@@ -333,10 +336,12 @@ def super_admins_kb(entries) -> InlineKeyboardMarkup:
 
 # --------------------------------------------------------------- Экспорт
 
-def export_kb(owner: bool = False) -> InlineKeyboardMarkup:
+def export_kb() -> InlineKeyboardMarkup:
+    """Экран экспорта VR Heaven. У владельца выгрузка живёт на своём
+    экране (`op:export`) и этой клавиатурой не пользуется."""
     kb = InlineKeyboardBuilder()
     kb.button(text="Выгрузить всё", callback_data="ex:all")
-    kb.button(text="В меню", callback_data="sm" if owner else "am")
+    kb.button(text="В меню", callback_data="am")
     kb.adjust(1)
     return kb.as_markup()
 

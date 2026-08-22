@@ -187,8 +187,11 @@ def _actor(row, *, with_ids: bool) -> str:
     if row["actor_kind"] == "superadmin":
         return f"VR Heaven {row['actor_tg_id']}" if with_ids else "VR Heaven"
     if row["actor_kind"] == "staff":
+        # Роль актора в журнале не хранится, а из кабинета действует и
+        # владелец (вход, экспорт), поэтому подпись нейтральная — то же
+        # слово, что на экране «История действий»
         handle = row["actor_handle"] or f"id {row['actor_user_id']}"
-        return f"{ROLE_LABELS.get('admin', '')} {handle}".strip()
+        return f"кабинет {handle}"
     return "система"
 
 
