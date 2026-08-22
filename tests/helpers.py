@@ -102,6 +102,7 @@ class FakeBot:
         self.rich_error: str | None = None
         self.send_error_chats: set[int] = set()
         self.send_error: Exception | None = None
+        self.delete_error: Exception | None = None
         self.last_markup = None
         self.last_rich = None
         self._next_id = 1000
@@ -193,6 +194,9 @@ class FakeBot:
         return True
 
     async def delete_message(self, chat_id, message_id):
+        # Своё сообщение старше двух суток Telegram удалить не даёт
+        if self.delete_error:
+            raise self.delete_error
         self.deleted.append((chat_id, message_id))
         self.live.pop((chat_id, message_id), None)
 

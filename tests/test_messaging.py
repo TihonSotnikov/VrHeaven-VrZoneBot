@@ -11,9 +11,11 @@
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest
-from helpers import set_window, window_text
+from helpers import fake_msg, make_state, set_window, window_text
 
 import keyboards as kb
+from handlers.staff import cmd_start as staff_start
+from handlers.vrheaven import cmd_start as vrheaven_start
 from markup import TEXT_LIMIT, Report, Table
 from messaging import document_payload
 
@@ -67,6 +69,57 @@ async def test_failed_send_keeps_previous_window(db, ui, bot):
     assert bot.deleted == []
     assert (await db.get_window(CHAT))["message_id"] == old_id
     assert await window_text(db, CHAT) == "рабочий экран"
+
+
+async def test_fresh_window_is_placed_anew_instead_of_edited(db, ui, bot):
+    """Окно, поставленное заново, не зависит от судьбы прежнего."""
+    await ui.window(CHAT, "первый", kb.to_staff_menu_kb())
+    old_id = (await db.get_window(CHAT))["message_id"]
+    await ui.window(CHAT, "второй", kb.to_staff_menu_kb(), fresh=True)
+    new_id = (await db.get_window(CHAT))["message_id"]
+    assert bot.edited == []
+    assert bot.sent[-1] == (CHAT, new_id, "второй")
+    assert new_id != old_id
+    assert (CHAT, old_id) in bot.deleted
+    assert bot.interactive(CHAT) == [new_id]
+
+
+async def test_undeletable_previous_window_loses_its_buttons(db, ui, bot):
+    """Своё сообщение старше двух суток Telegram удалить не даёт. Тогда
+    у прежнего Окна снимаются кнопки: живое Окно в чате остаётся одно."""
+    await ui.window(CHAT, "первый", kb.to_staff_menu_kb())
+    old_id = (await db.get_window(CHAT))["message_id"]
+    bot.delete_error = TelegramBadRequest(
+        method=None, message="Bad Request: message can't be deleted")
+    await ui.window(CHAT, "второй", kb.to_staff_menu_kb(), fresh=True)
+    assert bot.markup_edits == [(CHAT, old_id, None)]
+    assert bot.interactive(CHAT) == [(await db.get_window(CHAT))["message_id"]]
+
+
+async def test_start_leaves_a_visible_message_in_a_cleared_chat(db, ui, bot):
+    """Человек очистил чат с ботом и написал /start.
+
+    Для Telegram прежнее Окно на месте: правка проходит успешно, бот
+    считает экран показанным — а в очищенном чате не появляется ничего,
+    и другой команды у человека нет. /start обязан оставить в чате новое,
+    видимое сообщение.
+    """
+    await set_window(db, CHAT, 500, "меню до очистки")
+    await staff_start(fake_msg("/start", chat_id=CHAT), make_state(db, CHAT),
+                      db, ui)
+    assert bot.sent, "после /start в чате не появилось ни одного сообщения"
+    assert bot.edited == []
+    assert (await db.get_window(CHAT))["message_id"] == bot.sent[-1][1]
+
+
+async def test_vrheaven_start_leaves_a_visible_message_in_a_cleared_chat(
+        db, ui, bot):
+    """То же для панели VR Heaven: очищенный чат лечится командой /start."""
+    await set_window(db, CHAT, 500, "панель до очистки")
+    await vrheaven_start(fake_msg("/start", chat_id=CHAT), make_state(db, CHAT), ui)
+    assert bot.sent, "после /start в чате не появилось ни одного сообщения"
+    assert bot.edited == []
+    assert (await db.get_window(CHAT))["message_id"] == bot.sent[-1][1]
 
 
 async def test_tap_on_foreign_message_never_deletes_it(db, ui, bot):

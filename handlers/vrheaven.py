@@ -157,7 +157,10 @@ async def _window(cb: CallbackQuery, ui: Messenger, content, markup=None) -> Non
 async def cmd_start(message: Message, state: FSMContext, ui: Messenger) -> None:
     await state.clear()
     await ui.drop_user_message(message)
-    await ui.window(message.chat.id, MENU_TEXT, kb.vrheaven_menu_kb())
+    # fresh=True: /start обязан оставить в чате видимое сообщение — см.
+    # Messenger.window. Правка прежнего Окна проходит и в очищенном чате,
+    # где человеку её уже не увидеть
+    await ui.window(message.chat.id, MENU_TEXT, kb.vrheaven_menu_kb(), fresh=True)
 
 
 @router.callback_query(F.data == "am")

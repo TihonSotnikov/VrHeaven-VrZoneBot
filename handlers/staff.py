@@ -142,10 +142,14 @@ async def cmd_start(message: Message, state: FSMContext, db: Database,
     await state.clear()
     await ui.drop_user_message(message)
     user = await db.get_user_by_chat(message.chat.id)
+    # fresh=True: /start обязан оставить в чате видимое сообщение — см.
+    # Messenger.window. Правка прежнего Окна проходит и в очищенном чате,
+    # где человеку её уже не увидеть
     if user:
-        await ui.window(message.chat.id, _menu_text(user), _menu_kb(user))
+        await ui.window(message.chat.id, _menu_text(user), _menu_kb(user),
+                        fresh=True)
     else:
-        await ui.window(message.chat.id, WELCOME_TEXT, kb.welcome_kb())
+        await ui.window(message.chat.id, WELCOME_TEXT, kb.welcome_kb(), fresh=True)
 
 
 @router.callback_query(F.data == "slogin")

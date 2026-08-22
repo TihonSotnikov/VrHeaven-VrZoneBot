@@ -151,18 +151,27 @@ class Messenger:
     # --------------------------------------------------------------- Окно
 
     async def window(self, chat_id: int, content, markup=None, *,
-                     source_message_id: int | None = None) -> None:
+                     source_message_id: int | None = None,
+                     fresh: bool = False) -> None:
         """Показывает Окно чата: правит текущее или ставит новое.
 
         source_message_id — сообщение, кнопку которого нажали. Нажатое
         сообщение не удаляется никогда: это может быть Запись. Если окно
         чата ещё не известно (первый запуск, потерянный указатель), нажатое
         сообщение усыновляется как окно.
+
+        fresh — не пытаться править прежнее Окно, а сразу поставить новое.
+        Так отвечает /start. Чат, очищенный пользователем, для Telegram
+        по-прежнему содержит прежнее Окно: правка проходит успешно, бот
+        считает экран показанным, а человек не видит ничего — и выйти из
+        этого состояния ему нечем. Единственная команда, которой он
+        располагает, обязана оставить в чате видимое сообщение.
         """
         markup_json = markup.model_dump_json() if markup is not None else None
         async with self.chat_lock(chat_id):
             current = await self.db.get_window(chat_id)
-            target = current["message_id"] if current else source_message_id
+            target = None if fresh else (
+                current["message_id"] if current else source_message_id)
             if target is not None:
                 text, rich = self.render(content)
                 try:
@@ -203,9 +212,10 @@ class Messenger:
         модель делала окном чата и его. Удалять такое нельзя, поэтому у
         сообщения только снимаются кнопки, и оно остаётся Записью.
         """
-        if row["text"]:
-            await self._delete(chat_id, row["message_id"])
+        if row["text"] and await self._delete(chat_id, row["message_id"]):
             return
+        # Удалить не вышло: сообщение старше двух суток или его уже нет.
+        # Тогда хотя бы снимаем кнопки — живое Окно в чате ровно одно
         try:
             await self.bot.edit_message_reply_markup(
                 chat_id=chat_id, message_id=row["message_id"], reply_markup=None)
@@ -219,11 +229,13 @@ class Messenger:
             await self.db.save_window(tx, chat_id, message_id, text=text,
                                       markup_json=markup_json, rich=rich)
 
-    async def _delete(self, chat_id: int, message_id: int) -> None:
+    async def _delete(self, chat_id: int, message_id: int) -> bool:
         try:
             await self.bot.delete_message(chat_id, message_id)
         except TelegramAPIError as e:
             log.info("Окно %s чата %s уже недоступно: %s", message_id, chat_id, e)
+            return False
+        return True
 
     async def reanchor(self, chat_id: int) -> None:
         """Переставляет Окно под свежие Записи, сохраняя его содержимое.
