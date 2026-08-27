@@ -38,6 +38,7 @@ from handlers.vrheaven import (
     setting_ask,
     setting_set,
     setting_toggle,
+    settings_free15,
     settings_menu,
     stale_callback,
     summary,
@@ -317,7 +318,7 @@ async def test_settings_are_grouped_into_four_decisions(db, ui):
     assert buttons[-1] == "В меню"
     assert any(b.startswith("Скидка") for b in buttons)
     assert any(b.startswith("Акции") for b in buttons)
-    assert any(b.startswith("ПК-бонус") for b in buttons)
+    assert any(b.startswith("15 минут бесплатно") for b in buttons)
 
 
 async def test_setting_edit_flow(db, ui):
@@ -386,11 +387,28 @@ async def test_all_days_off_warns_that_discount_is_dead(db, ui):
 
 async def test_toggle_flips_and_is_audited(db, ui):
     await _panel(db)
-    await setting_toggle(_cb("st:tgl:pc_bonus_enabled"), db, ui)
-    assert (await db.get_settings())["pc_bonus_enabled"] == 0
-    cb = _cb("st:tgl:group_enabled")            # ключа прежней версии больше нет
-    await setting_toggle(cb, db, ui)
-    assert cb.answer.await_args.kwargs.get("show_alert") is True
+    await setting_toggle(_cb("st:tgl:discount_enabled"), db, ui)
+    assert (await db.get_settings())["discount_enabled"] == 0
+    log = await db.export_audit()
+    assert log[-1]["action"] == "setting.change"
+    for gone in ("st:tgl:group_enabled", "st:tgl:pc_bonus_enabled"):
+        cb = _cb(gone)                          # ключей прежних версий больше нет
+        await setting_toggle(cb, db, ui)
+        assert cb.answer.await_args.kwargs.get("show_alert") is True
+
+
+async def test_free15_toggle_lives_in_settings(db, ui):
+    """Тип заказа включает и выключает только VR Heaven."""
+    await _panel(db)
+    await settings_free15(_cb("st:free"), make_state(db, VR_CHAT), db, ui)
+    assert "15 минут бесплатно" in await window_text(db, VR_CHAT)
+    await setting_toggle(_cb("st:tgl:free15_enabled"), db, ui)
+    assert (await db.get_settings())["free15_enabled"] == 0
+    assert "Сейчас выключено" in await window_text(db, VR_CHAT)
+    log = await db.export_audit()
+    assert log[-1]["action"] == "setting.change"
+    await setting_toggle(_cb("st:tgl:free15_enabled"), db, ui)
+    assert (await db.get_settings())["free15_enabled"] == 1
 
 
 # ------------------------------------------------------------------ Экспорт

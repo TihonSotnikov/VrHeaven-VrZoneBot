@@ -165,7 +165,7 @@ async def test_malformed_callback_never_escapes_as_an_exception(
     dp = _dispatcher(db, ui, config)
     for index, data in enumerate([
         "ad:card:abc", "ad:card:", "ac:o:99999999999999999999",
-        "sc:o:", "no:promo:x", "po:ok:-", "st:set:неизвестно", "пусто",
+        "sc:o:", "no:p:1:30:x", "po:ok:-", "st:set:неизвестно", "пусто",
     ], start=1):
         await dp.feed_update(bot, _callback(data, chat_id=VR_CHAT, update_id=index))
     assert len(bot.answers) == 8

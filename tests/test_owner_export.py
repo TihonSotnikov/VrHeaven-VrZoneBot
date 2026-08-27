@@ -44,7 +44,9 @@ async def test_owner_export_is_scoped_to_own_data(db, ui, config, bot, worker):
 
     my_order = await make_order(db, mine, owner, price=790, admin_share=50)
     async with db.write() as tx:
-        promo_id = await db.create_promo(tx, "3=4", 600)
+        promo_id = await db.create_promo(tx, "3=4")
+    # исторический заказ прежнего типа «акция» со своей записанной ценой:
+    # выгрузка обязана показывать его ровно так, как он записан
     my_promo = await make_order(db, mine, owner, price=600, kind="promo",
                                 headsets=None, minutes=None, promo_id=promo_id,
                                 promo_name="3=4", series_pos=2)
@@ -185,7 +187,7 @@ async def test_owner_export_files_are_utf8_with_a_signature(
     await bind(db, owner, OWNER_CHAT)
     await set_window(db, OWNER_CHAT, WINDOW)
     async with db.write() as tx:
-        promo_id = await db.create_promo(tx, "Акция «Три по цене двух»", 600)
+        promo_id = await db.create_promo(tx, "Акция «Три по цене двух»")
     await make_order(db, admin, owner, price=600, kind="promo", headsets=None,
                      minutes=None, promo_id=promo_id,
                      promo_name="Акция «Три по цене двух»", series_pos=2)
@@ -216,7 +218,7 @@ async def test_exported_values_do_not_become_spreadsheet_formulas(
     await bind(db, owner, OWNER_CHAT)
     await set_window(db, OWNER_CHAT, WINDOW)
     async with db.write() as tx:
-        promo_id = await db.create_promo(tx, "=1+1", 600)
+        promo_id = await db.create_promo(tx, "=1+1")
     await make_order(db, admin, owner, price=600, kind="promo", headsets=None,
                      minutes=None, promo_id=promo_id, promo_name="=1+1",
                      series_pos=2)

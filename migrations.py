@@ -421,6 +421,219 @@ async def _verify_v3(conn) -> None:
         raise RuntimeError("После миграции v3 в orders нет колонки series_since")
 
 
+# --------------------------------- v4: бесплатные 15 минут как тип заказа
+#
+# «15 минут бесплатно» — не заказ с нулевой ценой, а отдельный тип: он не
+# занимает ступень лесенки, и опознавать его приходится во всех отчётах,
+# выгрузках и проверках. Опознание по совпадению цены с нулём было бы
+# догадкой — тип записан в самом заказе.
+#
+# CHECK по `kind` SQLite на месте не меняет, поэтому таблица заказов
+# пересобирается тем же порядком, что в v1, со сверкой числа строк до и
+# после. Все колонки переносятся явно: молчаливая потеря `client_token`
+# сняла бы защиту от повторного оформления.
+#
+# Здесь же уходят настройки прежнего ПК-бонуса: понятие удалено целиком,
+# а строка в settings, которую никто не читает, — приглашение к ошибке.
+
+ORDERS_TABLE_V4 = """
+CREATE TABLE orders (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id         INTEGER NOT NULL REFERENCES users(id),
+    owner_id         INTEGER REFERENCES users(id),
+    kind             TEXT    NOT NULL
+        CHECK (kind IN ('standard', 'group', 'promo', 'free15')),
+    headsets         INTEGER,
+    minutes          INTEGER,
+    promo_id         INTEGER REFERENCES promos(id),
+    promo_name       TEXT,
+    base_price       REAL    NOT NULL,
+    discount_percent REAL    NOT NULL DEFAULT 0,
+    price            REAL    NOT NULL,
+    admin_percent    REAL    NOT NULL,
+    admin_share      REAL    NOT NULL,
+    series_pos       INTEGER,
+    series_since     TEXT,
+    owner_percent    REAL    NOT NULL DEFAULT 0,
+    owner_share      REAL    NOT NULL DEFAULT 0,
+    owner_suspended  INTEGER NOT NULL DEFAULT 0,
+    admin_payout_id  INTEGER REFERENCES payouts(id),
+    owner_payout_id  INTEGER REFERENCES payouts(id),
+    client_token     TEXT,
+    quoted_at        TEXT,
+    cancelled_at     TEXT,
+    created_at       TEXT    NOT NULL
+)
+"""
+
+# Индексы заказов уносит вместе с прежней таблицей — все до одного
+# создаются заново, включая уникальный по client_token (идемпотентность
+# оформления) и индекс серии из v3.
+ORDERS_INDEXES_V4 = [
+    *ORDERS_INDEXES_V1,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_token"
+    " ON orders(client_token) WHERE client_token IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)",
+    *SCHEMA_V3,
+]
+
+_ORDERS_COLS_V4 = (
+    "id, admin_id, owner_id, kind, headsets, minutes, promo_id, promo_name,"
+    " base_price, discount_percent, price, admin_percent, admin_share,"
+    " series_pos, series_since, owner_percent, owner_share, owner_suspended,"
+    " admin_payout_id, owner_payout_id, client_token, quoted_at, cancelled_at,"
+    " created_at"
+)
+
+_ORDERS_COLS_V4_SET = frozenset(_ORDERS_COLS_V4.replace(" ", "").split(","))
+
+OBSOLETE_SETTINGS_V4 = ("pc_bonus_enabled", "pc_bonus_points")
+
+
+async def _orders_sql(conn) -> str:
+    return await _scalar(
+        conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ) or ""
+
+
+async def _apply_v4(conn) -> None:
+    if "free15" not in await _orders_sql(conn):
+        before = await _scalar(conn, "SELECT COUNT(*) FROM orders")
+        # Число строк не поймало бы потерю колонки: перенос идёт по
+        # списку имён, и колонка, которой в списке нет, исчезла бы молча
+        lost = await _columns(conn, "orders") - _ORDERS_COLS_V4_SET
+        if lost:
+            raise RuntimeError(
+                f"Пересборка заказов потеряла бы колонки: {sorted(lost)}."
+                f" Перенесите их вручную и запустите обновление снова"
+            )
+        await conn.execute("ALTER TABLE orders RENAME TO orders_legacy")
+        await conn.execute(ORDERS_TABLE_V4)
+        await conn.execute(
+            f"INSERT INTO orders ({_ORDERS_COLS_V4})"
+            f" SELECT {_ORDERS_COLS_V4} FROM orders_legacy"
+        )
+        after = await _scalar(conn, "SELECT COUNT(*) FROM orders")
+        if after != before:
+            raise RuntimeError(
+                f"Пересборка заказов потеряла строки: было {before}, стало {after}"
+            )
+        # DROP уносит индексы прежней таблицы — создаём их заново
+        await conn.execute("DROP TABLE orders_legacy")
+        for statement in ORDERS_INDEXES_V4:
+            await conn.execute(statement)
+    await conn.execute(
+        "DELETE FROM settings WHERE key IN (?, ?)", OBSOLETE_SETTINGS_V4
+    )
+
+
+async def _verify_v4(conn) -> None:
+    if "free15" not in await _orders_sql(conn):
+        raise RuntimeError("После миграции v4 заказы не принимают тип free15")
+    missing = _ORDERS_COLS_V4_SET - await _columns(conn, "orders")
+    if missing:
+        raise RuntimeError(f"После миграции v4 в orders нет колонок: {missing}")
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='orders'")
+    indexes = {row[0] for row in await cur.fetchall()}
+    if "idx_orders_client_token" not in indexes:
+        raise RuntimeError(
+            "После миграции v4 нет уникального индекса по client_token:"
+            " повторное оформление создало бы второй заказ")
+    if await _scalar(
+        conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+              " AND name='orders_legacy'"
+    ):
+        raise RuntimeError("После миграции v4 осталась прежняя таблица заказов")
+    if await _scalar(conn, "SELECT COUNT(*) FROM settings WHERE key IN (?, ?)",
+                     OBSOLETE_SETTINGS_V4):
+        raise RuntimeError("После миграции v4 остались настройки ПК-бонуса")
+
+
+# ------------------------------- v5: у акции больше нет денежной величины
+#
+# Акция — приз колеса фортуны, то есть текстовый признак заказа: какой
+# приз клиенту достался. Денежной величины у неё нет и не должно быть,
+# иначе рано или поздно кто-нибудь снова вычтет её из цены сеанса. Колонка
+# `promos.price` уходит из схемы — «оставить и не читать» здесь хуже, чем
+# убрать: невидимое поле переживает любую договорённость.
+#
+# Заказы не трогаются вовсе. Цены, доли и остатки, записанные когда
+# угодно, остаются ровно такими, как записаны, — включая исторические
+# заказы прежнего типа `promo`, у которых цена когда-то бралась из акции.
+# Снимок названия (`orders.promo_name`) — всё, что связывает заказ с
+# акцией, и он остаётся на месте.
+#
+# Таблица пересобирается, а не правится ALTER-ом: DROP COLUMN появился
+# только в SQLite 3.35, а версию на сервере знать заранее нельзя.
+# Порядок действий выбран так, чтобы не переименовывать саму `promos`:
+# при переименовании SQLite переписывает ссылки на старое имя в других
+# таблицах, и `orders.promo_id REFERENCES promos(id)` стал бы ссылаться
+# на временную таблицу. Поэтому новая таблица создаётся под своим именем
+# и получает имя `promos` последней, когда ссылаться на неё уже некому.
+
+PROMOS_TABLE_V5 = """
+CREATE TABLE promos_v5 (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    name_folded TEXT,
+    archived_at TEXT,
+    created_at  TEXT    NOT NULL
+)
+"""
+
+PROMOS_INDEX_V5 = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_promos_active_name"
+    " ON promos(name_folded) WHERE archived_at IS NULL"
+)
+
+_PROMOS_COLS_V5 = "id, name, name_folded, archived_at, created_at"
+
+
+async def _apply_v5(conn) -> None:
+    if "price" not in await _columns(conn, "promos"):
+        return
+    before = await _scalar(conn, "SELECT COUNT(*) FROM promos")
+    await conn.execute(PROMOS_TABLE_V5)
+    await conn.execute(
+        f"INSERT INTO promos_v5 ({_PROMOS_COLS_V5})"
+        f" SELECT {_PROMOS_COLS_V5} FROM promos"
+    )
+    after = await _scalar(conn, "SELECT COUNT(*) FROM promos_v5")
+    if after != before:
+        raise RuntimeError(
+            f"Пересборка акций потеряла строки: было {before}, стало {after}"
+        )
+    await conn.execute("DROP TABLE promos")
+    await conn.execute("ALTER TABLE promos_v5 RENAME TO promos")
+    await conn.execute(PROMOS_INDEX_V5)
+
+
+async def _verify_v5(conn) -> None:
+    columns = await _columns(conn, "promos")
+    if "price" in columns:
+        raise RuntimeError("После миграции v5 у акций осталась денежная величина")
+    if set(_PROMOS_COLS_V5.replace(" ", "").split(",")) - columns:
+        raise RuntimeError(f"После миграции v5 в promos нет колонок: {columns}")
+    if await _scalar(
+        conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+              " AND name='promos_v5'"
+    ):
+        raise RuntimeError("После миграции v5 осталась временная таблица акций")
+    if not await _scalar(
+        conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+              " AND name='idx_promos_active_name'"
+    ):
+        raise RuntimeError(
+            "После миграции v5 нет уникального индекса по названию акции")
+    # Заказы обязаны пережить пересборку нетронутыми — и данными, и связью
+    orders_sql = await _orders_sql(conn)
+    if "REFERENCES promos(id)" not in orders_sql:
+        raise RuntimeError(
+            "После миграции v5 заказы ссылаются не на таблицу акций:"
+            " переименование увело связь на временную таблицу")
+
+
 # ------------------------------------------------------------------ Раннер
 
 @dataclass(frozen=True)
@@ -436,6 +649,10 @@ MIGRATIONS: list[Migration] = [
     Migration(1, "базовая схема", _apply_v1, _verify_v1, rebuilds_tables=True),
     Migration(2, "надёжность: журнал, очередь, окно, состояние", _apply_v2, _verify_v2),
     Migration(3, "граница серии хранится в заказе", _apply_v3, _verify_v3),
+    Migration(4, "бесплатные 15 минут — отдельный тип заказа", _apply_v4,
+              _verify_v4, rebuilds_tables=True),
+    Migration(5, "у акции нет денежной величины", _apply_v5, _verify_v5,
+              rebuilds_tables=True),
 ]
 
 LATEST_VERSION = max(m.version for m in MIGRATIONS)

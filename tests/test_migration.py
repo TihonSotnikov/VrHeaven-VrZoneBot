@@ -116,9 +116,12 @@ async def test_legacy_database_is_carried_over_without_losses(tmp_path):
         assert (await db.get_user_by_chat(777))["handle"] == "adm"
         assert (await db.get_user(2))["series_reset_min"] is None
         assert (await db.get_settings())["price_1_30"] == 350
+        # акция «3=4» перенесена из настроек; денежная величина, которая
+        # была у неё в прежней модели, снята миграцией v5
         promos = await db.list_promos()
-        assert [(p["name"], p["price"]) for p in promos] == [("3=4", 650.0)]
+        assert [p["name"] for p in promos] == ["3=4"]
         assert promos[0]["name_folded"] == "3=4"
+        assert "price" not in promos[0].keys()
         assert (await db.payouts_for_user(2))[0]["amount"] == 50.0
         # прежние окна перенесены указателями и убираются при первом обращении
         window = await db.get_window(777)
@@ -342,3 +345,178 @@ async def test_v3_is_idempotent_across_restarts(tmp_path):
     columns = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
     conn.close()
     assert columns.count("series_since") == 1
+
+
+async def test_v4_rebuilds_orders_without_losing_anything(tmp_path):
+    """Пересборка ради нового типа не имеет права потерять ни строки,
+    ни ссылки на выплату, ни ключ идемпотентности, ни снимок акции."""
+    path = str(tmp_path / "legacy.db")
+    _legacy_db(path, settings={"price_group": 650})
+
+    db = Database(path)
+    await db.init()
+    try:
+        orders = await db.export_orders()
+        assert [o["id"] for o in orders] == [1, 2]
+        paid = await db.get_order(1)
+        assert paid["price"] == 500 and paid["admin_payout_id"] == 1
+        assert (await db.get_order(2))["kind"] == "group"   # прежний тип уцелел
+        # уникальность ключа оформления пережила пересборку
+        indexes = {r[0] for r in await db.fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND tbl_name='orders'")}
+        assert {"idx_orders_client_token", "idx_orders_series",
+                "idx_orders_admin_unpaid", "idx_orders_owner_unpaid",
+                "idx_orders_admin_created", "idx_orders_created"} <= indexes
+        assert not await db.fetchall(
+            "SELECT name FROM sqlite_master WHERE name = 'orders_legacy'")
+    finally:
+        await db.close()
+
+
+async def test_v4_accepts_the_free_session_and_still_refuses_nonsense(tmp_path):
+    path = str(tmp_path / "kinds.db")
+    db = Database(path)
+    await db.init()
+    try:
+        async with db.write() as tx:
+            await tx.execute(
+                "INSERT INTO users (id, role, handle, name, password_hash,"
+                " percent, created_at) VALUES (1, 'admin', 'a', 'A', 'x', 0, 'now')")
+            await tx.execute(
+                "INSERT INTO orders (admin_id, kind, base_price, discount_percent,"
+                " price, admin_percent, admin_share, created_at)"
+                " VALUES (1, 'free15', 0, 0, 0, 0, 0, 'now')")
+        assert (await db.get_order(1))["kind"] == "free15"
+        with pytest.raises(sqlite3.IntegrityError):
+            async with db.write() as tx:
+                await tx.execute(
+                    "INSERT INTO orders (admin_id, kind, base_price,"
+                    " discount_percent, price, admin_percent, admin_share,"
+                    " created_at) VALUES (1, 'whatever', 0, 0, 0, 0, 0, 'now')")
+    finally:
+        await db.close()
+
+
+async def test_v4_refuses_to_drop_a_column_it_does_not_know(tmp_path, monkeypatch):
+    """Число строк потерю колонки не ловит — перенос идёт по именам.
+    Незнакомая колонка обязана остановить обновление, а не исчезнуть."""
+    path = str(tmp_path / "extra.db")
+    _legacy_db(path)
+    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:3])
+    db = Database(path)
+    await db.init()                                   # доводим базу до v3
+    await db.close()
+    monkeypatch.undo()
+
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE orders ADD COLUMN hand_written TEXT")
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    with pytest.raises(RuntimeError, match="потеряла бы колонки"):
+        await db.init()
+    assert (await db.fetchone("PRAGMA user_version"))[0] == 3
+    columns = {r[1] for r in await db.fetchall("PRAGMA table_info(orders)")}
+    assert "hand_written" in columns
+    assert len(await db.export_orders()) == 2
+    await db.close()
+
+
+async def test_v4_removes_the_obsolete_pc_bonus_settings(tmp_path):
+    """Понятие удалено целиком — строка, которую никто не читает, уходит."""
+    path = str(tmp_path / "legacy.db")
+    _legacy_db(path, settings={"pc_bonus_enabled": 0, "pc_bonus_points": 250,
+                               "price_1_30": 350})
+    db = Database(path)
+    await db.init()
+    try:
+        stored = {r["key"] for r in await db.fetchall("SELECT key FROM settings")}
+        assert "pc_bonus_enabled" not in stored and "pc_bonus_points" not in stored
+        settings = await db.get_settings()
+        assert "pc_bonus_enabled" not in settings
+        assert settings["price_1_30"] == 350        # чужие настройки не тронуты
+        assert settings["free15_enabled"] == 1
+    finally:
+        await db.close()
+
+
+async def test_v5_drops_the_promo_money_and_keeps_the_promos(tmp_path):
+    """Величина уходит из схемы; акции, их имена и связь с заказами — нет."""
+    path = str(tmp_path / "legacy.db")
+    _legacy_db(path, settings={"price_group": 650})
+    db = Database(path)
+    await db.init()
+    try:
+        columns = {r[1] for r in await db.fetchall("PRAGMA table_info(promos)")}
+        assert columns == {"id", "name", "name_folded", "archived_at",
+                           "created_at"}
+        promos = await db.list_promos()
+        assert [(p["id"], p["name"]) for p in promos] == [(1, "3=4")]
+        assert not await db.fetchall(
+            "SELECT name FROM sqlite_master WHERE name = 'promos_v5'")
+        # связь заказов с акциями уцелела: переименование не увело её
+        # на временную таблицу
+        orders_sql = await db.fetchone(
+            "SELECT sql FROM sqlite_master WHERE name = 'orders'")
+        assert "REFERENCES promos(id)" in orders_sql[0]
+        assert not await db.fetchall("PRAGMA foreign_key_check")
+    finally:
+        await db.close()
+
+
+async def test_v5_does_not_reprice_a_single_order(tmp_path):
+    """Исторические деньги неприкосновенны — включая заказы прежнего типа
+    «акция», у которых цена когда-то бралась из самой акции."""
+    path = str(tmp_path / "legacy.db")
+    _legacy_db(path)
+    conn = sqlite3.connect(path)
+    before = conn.execute(
+        "SELECT id, kind, price, admin_share, owner_share FROM orders"
+        " ORDER BY id").fetchall()
+    conn.close()
+    assert before, "в фикстуре должны быть заказы"
+
+    db = Database(path)
+    await db.init()
+    try:
+        after = [tuple(r) for r in await db.fetchall(
+            "SELECT id, kind, price, admin_share, owner_share FROM orders"
+            " ORDER BY id")]
+        assert after == before
+        # исторический заказ типа «акция» сохранил свою прежнюю цену
+        assert (2, "group", 600.0) == after[1][:3]
+    finally:
+        await db.close()
+
+
+async def test_v5_is_idempotent_across_restarts(tmp_path):
+    path = str(tmp_path / "again.db")
+    _legacy_db(path)
+    for _ in range(3):
+        db = Database(path)
+        await db.init()
+        assert await db.schema_version() == LATEST_VERSION
+        await db.close()
+    conn = sqlite3.connect(path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(promos)")]
+    promos = conn.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
+    conn.close()
+    assert "price" not in columns and columns.count("name") == 1
+    assert promos == 1
+
+
+async def test_v4_is_idempotent_across_restarts(tmp_path):
+    path = str(tmp_path / "again.db")
+    _legacy_db(path)
+    for _ in range(3):
+        db = Database(path)
+        await db.init()
+        assert await db.schema_version() == LATEST_VERSION
+        await db.close()
+    conn = sqlite3.connect(path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
+    count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    conn.close()
+    assert columns.count("kind") == 1 and count == 2

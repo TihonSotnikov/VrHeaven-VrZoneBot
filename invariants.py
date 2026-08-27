@@ -18,7 +18,7 @@ import sys
 from bisect import bisect_left, insort
 from dataclasses import dataclass
 
-from pricing import SALARY_LADDER, ladder_amount
+from pricing import KIND_FREE15, SALARY_LADDER, ladder_amount
 
 # Копейка в двоичной дроби точно не представима: 0.1 + 0.2 != 0.3.
 # Допуск на порядки меньше копейки — расхождение сверх него означает,
@@ -104,12 +104,19 @@ def _check_order_shares(conn) -> list[str]:
     Остаток VR Heaven не хранится: он и есть цена минус две доли, поэтому
     проверяются его составляющие — доля владельца считается его процентом,
     вознаграждение администратора берётся из лесенки.
+
+    Бесплатные 15 минут проверяются по собственному правилу: цена и
+    вознаграждение обязаны быть нулями, а места в лесенке у такого заказа
+    нет — иначе ступень досталась бы даром и подняла бы вознаграждение за
+    следующий заказ. Тип заказа спрашивается у файла: снимок перед первой
+    миграцией снимается и с базы, где колонки `kind` ещё нет.
     """
     problems = []
-    for row in conn.execute(
-        "SELECT id, price, admin_share, owner_share, owner_percent, series_pos,"
-        " owner_id FROM orders"
-    ):
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+    has_kind = "kind" in columns
+    fields = ("id, price, admin_share, owner_share, owner_percent, series_pos,"
+              " owner_id" + (", kind" if has_kind else ""))
+    for row in conn.execute(f"SELECT {fields} FROM orders"):
         for field in ("price", "admin_share", "owner_share"):
             if _not_whole_cents(row[field]):
                 problems.append(
@@ -123,6 +130,17 @@ def _check_order_shares(conn) -> list[str]:
             )
         if row["owner_id"] is None and _cents(row["owner_share"]) != 0:
             problems.append(f"заказ №{row['id']}: доля владельца без владельца")
+        if has_kind and row["kind"] == KIND_FREE15:
+            if _cents(row["price"]) or _cents(row["admin_share"]):
+                problems.append(
+                    f"заказ №{row['id']}: бесплатный сеанс с ценой {row['price']}"
+                    f" и вознаграждением {row['admin_share']}"
+                )
+            if row["series_pos"] is not None:
+                problems.append(
+                    f"заказ №{row['id']}: бесплатный сеанс занял место"
+                    f" {row['series_pos']} в серии"
+                )
         if row["series_pos"] is not None:
             expected_admin = ladder_amount(row["series_pos"])
             if _cents(row["admin_share"]) != _cents(expected_admin):

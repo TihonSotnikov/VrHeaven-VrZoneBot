@@ -176,6 +176,32 @@ def test_report_fits_the_limit_and_keeps_its_totals(rich):
 
 
 @pytest.mark.parametrize("rich", [True, False])
+def test_report_keeps_every_block_after_the_last_table(rich):
+    """Целым остаётся не «последний блок», а весь хвост после последней
+    таблицы. Иначе приписка внизу вытесняла итоги: отчёт дня выплат
+    сохранял «выплата проводится вручную» и терял суммы, ради которых
+    его читают."""
+    report = _bulky_report().add("Выплата проводится вручную")
+    html = report.to_html(rich=rich)
+    assert len(html) <= TEXT_LIMIT
+    assert "Остаток VR Heaven: 1 000 ₽" in html
+    assert "Выплата проводится вручную" in html
+    validate_html(html)
+
+
+@pytest.mark.parametrize("rich", [True, False])
+def test_report_without_tables_still_keeps_its_last_block(rich):
+    report = Report("Отчёт")
+    for i in range(200):
+        report.add(f"строка {i} " + "ы" * 40)
+    report.add("итог")
+    html = report.to_html(rich=rich)
+    assert len(html) <= TEXT_LIMIT
+    assert html.endswith("итог</p>" if rich else "итог")
+    validate_html(html)
+
+
+@pytest.mark.parametrize("rich", [True, False])
 def test_short_report_is_untouched(rich):
     report = Report("Сводка").add(Table(["a"], [["b"]])).add("итого")
     html = report.to_html(rich=rich)

@@ -181,17 +181,17 @@ async def test_promo_name_uniqueness_is_cyrillic_aware(db):
     """SQLite lower() не сворачивает кириллицу — сравниваем casefold()."""
     import sqlite3
     async with db.write() as tx:
-        await db.create_promo(tx, "День Рождения", 500)
+        await db.create_promo(tx, "День Рождения")
     assert await db.promo_name_taken("день рождения") is True
     with pytest.raises(sqlite3.IntegrityError):
         async with db.write() as tx:
-            await db.create_promo(tx, "день рождения", 600)
+            await db.create_promo(tx, "день рождения")
 
 
 async def test_archived_promo_name_is_reusable(db):
     async with db.write() as tx:
-        promo_id = await db.create_promo(tx, "День рождения", 500)
+        promo_id = await db.create_promo(tx, "День рождения")
         await db.archive_promo(tx, promo_id)
     assert await db.promo_name_taken("ДЕНЬ РОЖДЕНИЯ") is False
     async with db.write() as tx:
-        await db.create_promo(tx, "ДЕНЬ РОЖДЕНИЯ", 700)
+        await db.create_promo(tx, "ДЕНЬ РОЖДЕНИЯ")

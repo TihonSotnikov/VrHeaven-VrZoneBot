@@ -35,18 +35,19 @@ from handlers.common import (
     guide_bytes,
     guide_caption,
 )
-from markup import h, join
+from markup import h, join, lines
 from messaging import Messenger, document_payload
 from pricing import (
+    FREE15_LABEL,
     HEADSETS_CHOICES,
-    KIND_PROMO,
+    KIND_FREE15,
     KIND_STANDARD,
     MINUTES_CHOICES,
     ladder_amount,
     normalize_reset,
     order_label,
     order_row_label,
-    pc_bonus_applies,
+    promo_applies,
     quote,
 )
 from utils import (
@@ -373,11 +374,12 @@ async def _require_active_admin(cb: CallbackQuery, state: FSMContext,
 
 
 async def _headsets_screen(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
-    promos = await db.list_promos()
+    """Шаг «сколько шлемов»; «Назад» есть, только когда выше есть экран."""
+    settings = await db.get_settings()
     await ui.window(
         cb.message.chat.id,
         join("<b>Новый заказ · стандартный сеанс</b>", "Сколько шлемов?"),
-        kb.headsets_kb(with_back=bool(promos)),
+        kb.headsets_kb(with_back=bool(settings["free15_enabled"])),
         source_message_id=cb.message.message_id,
     )
 
@@ -385,19 +387,25 @@ async def _headsets_screen(cb: CallbackQuery, db: Database, ui: Messenger) -> No
 @router.callback_query(F.data == "no:new")
 async def order_new(cb: CallbackQuery, state: FSMContext, db: Database,
                     ui: Messenger) -> None:
-    """Экран выбора типа показывается, только когда есть из чего выбирать."""
+    """Первый шаг заказа.
+
+    Экран выбора типа показывается, только когда есть из чего выбирать:
+    единственный тип — это лишнее нажатие на каждом заказе. Акции здесь
+    больше не выбираются — акция принадлежит заказу и предлагается после
+    шлемов и длительности.
+    """
     user = await _require_active_admin(cb, state, db, ui)
     if not user:
         return
     await state.clear()
-    promos = await db.list_promos()
-    if not promos:
+    settings = await db.get_settings()
+    if not settings["free15_enabled"]:
         await _headsets_screen(cb, db, ui)
         await cb.answer()
         return
     await ui.window(cb.message.chat.id,
                     join("<b>Новый заказ</b>", "Выберите тип заказа"),
-                    kb.order_kind_kb(promos),
+                    kb.order_kind_kb(),
                     source_message_id=cb.message.message_id)
     await cb.answer()
 
@@ -432,24 +440,83 @@ async def order_headsets(cb: CallbackQuery, state: FSMContext, db: Database,
     await cb.answer()
 
 
-def _order_confirm_text(settings: dict, q, headsets: int, minutes: int) -> str:
-    """Экран подтверждения стандартного сеанса: цена и ПК-бонус."""
-    lines = [h("<b>Новый заказ · {}</b>",
-               order_label(KIND_STANDARD, headsets, minutes))]
+def _order_confirm_text(q, headsets: int, minutes: int, promo) -> str:
+    """Экран подтверждения стандартного сеанса: состав, цена, приз, оплата.
+
+    Акция — приз колеса фортуны, а не скидка: к оплате идёт обычная цена
+    сеанса, посчитанная так же, как без акции. Приз назван строкой
+    **после** суммы к оплате и без единой цифры: денег у него нет, а
+    у прилавка называют одну сумму.
+    """
+    parts = [h("<b>Новый заказ · {}</b>",
+               order_label(KIND_STANDARD, headsets, minutes,
+                           promo["name"] if promo else None))]
     if q.discount_percent:
-        lines.append(h("Базовая цена: {}\nСкидка: −{} (применена автоматически)",
+        parts.append(h("Базовая цена: {}\nСкидка: −{} (применена автоматически)",
                        fmt_money(q.base_price), fmt_percent(q.discount_percent)))
-    lines.append(h("<b>К оплате: {}</b>", fmt_money(q.price)))
-    if pc_bonus_applies(settings, KIND_STANDARD, minutes):
-        lines.append(h("Начислите клиенту {} баллов на ПК",
-                       int(settings["pc_bonus_points"])))
-    lines.append("Примите оплату наличными или переводом и подтвердите")
-    return join(*lines)
+    parts.append(h("<b>К оплате: {}</b>", fmt_money(q.price)))
+    if promo:
+        parts.append(h("Приз: {}\nНа цену сеанса приз не влияет",
+                       promo["name"]))
+    parts.append("Примите оплату наличными или переводом и подтвердите")
+    return join(*parts)
+
+
+async def _promo_screen(cb: CallbackQuery, db: Database, ui: Messenger,
+                        promos, headsets: int, minutes: int) -> None:
+    """Шаг выбора приза: сеанс уже собран и назван в заголовке.
+
+    Правило названо прямо на экране выбора: приз записывается к заказу
+    для учёта, а цену сеанса не меняет. Именно здесь его легче всего
+    принять за скидку.
+    """
+    await ui.window(
+        cb.message.chat.id,
+        join(h("<b>Новый заказ · {}</b>",
+               order_label(KIND_STANDARD, headsets, minutes)),
+             "Выберите акцию — приз колеса фортуны — или продолжите без неё.",
+             "На цену сеанса приз не влияет"),
+        kb.promo_pick_kb(promos, headsets, minutes),
+        source_message_id=cb.message.message_id)
+
+
+async def _confirm_screen(cb: CallbackQuery, state: FSMContext, db: Database,
+                          ui: Messenger, config: Config, *, headsets: int,
+                          minutes: int, promo, back_cb: str) -> None:
+    """Ставит сценарий на подтверждение и показывает экран оплаты.
+
+    Цена считается от текущих настроек и фиксируется здесь: клиенту
+    названа именно она (SPEC §2). Акция в расчёт цены не входит вовсе —
+    это приз колеса фортуны, у которого нет денежной величины: в заказ от
+    неё едут только `promo_id` и снимок названия, а `quote` об акциях не
+    знает. Бесплатный сеанс — не акция, а отдельный тип (KIND_FREE15).
+    """
+    settings = await db.get_settings()
+    q = quote(settings, datetime.now(config.tz), headsets, minutes)
+    await state.set_state(NewOrderSG.confirm)
+    await state.update_data(
+        client_token=uuid.uuid4().hex,
+        kind=KIND_STANDARD, headsets=headsets, minutes=minutes,
+        promo_id=promo["id"] if promo else None,
+        promo_name=promo["name"] if promo else None,
+        base_price=q.base_price, discount_percent=q.discount_percent,
+        price=q.price,
+        quoted_at=utcnow_iso(),
+    )
+    await ui.window(cb.message.chat.id,
+                    _order_confirm_text(q, headsets, minutes, promo),
+                    kb.payment_kb(back_cb),
+                    source_message_id=cb.message.message_id)
 
 
 @router.callback_query(F.data.startswith("no:d:"))
 async def order_duration(cb: CallbackQuery, state: FSMContext, db: Database,
                          ui: Messenger, config: Config) -> None:
+    """Длительность выбрана — дальше акция, если она вообще применима.
+
+    Акции предлагаются после шлемов и длительности и только к сеансам
+    не короче 30 минут; когда предлагать нечего, шаг не показывается.
+    """
     user = await _require_active_admin(cb, state, db, ui)
     if not user:
         return
@@ -461,55 +528,87 @@ async def order_duration(cb: CallbackQuery, state: FSMContext, db: Database,
     if headsets not in HEADSETS_CHOICES or minutes not in MINUTES_CHOICES:
         await cb.answer(STALE_BUTTON, show_alert=True)
         return
-    # Цена считается от текущих настроек и фиксируется на экране
-    # подтверждения: клиенту названа именно она (SPEC §2)
-    settings = await db.get_settings()
-    q = quote(settings, datetime.now(config.tz), headsets, minutes)
-    await state.set_state(NewOrderSG.confirm)
-    await state.update_data(
-        client_token=uuid.uuid4().hex,
-        kind=KIND_STANDARD, headsets=headsets, minutes=minutes,
-        promo_id=None, promo_name=None,
-        base_price=q.base_price, discount_percent=q.discount_percent, price=q.price,
-        quoted_at=utcnow_iso(),
-    )
-    await ui.window(cb.message.chat.id,
-                    _order_confirm_text(settings, q, headsets, minutes),
-                    kb.payment_kb(f"no:h:{headsets}"),
-                    source_message_id=cb.message.message_id)
+    promos = await db.list_promos() if promo_applies(minutes) else []
+    if promos:
+        await state.clear()
+        await _promo_screen(cb, db, ui, promos, headsets, minutes)
+        await cb.answer()
+        return
+    await _confirm_screen(cb, state, db, ui, config, headsets=headsets,
+                          minutes=minutes, promo=None,
+                          back_cb=f"no:h:{headsets}")
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("no:promo:"))
+@router.callback_query(F.data.startswith("no:p:"))
 async def order_promo(cb: CallbackQuery, state: FSMContext, db: Database,
-                      ui: Messenger) -> None:
+                      ui: Messenger, config: Config) -> None:
+    """Выбор акции к уже собранному сеансу; 0 — без акции."""
     user = await _require_active_admin(cb, state, db, ui)
     if not user:
         return
-    promo_id = cb_int(cb.data)
-    promo = await db.get_promo(promo_id) if promo_id else None
-    if not promo or promo["archived_at"] is not None:
-        await state.clear()
-        await ui.window(cb.message.chat.id,
-                        join("<b>Новый заказ</b>", "Выберите тип заказа"),
-                        kb.order_kind_kb(await db.list_promos()),
-                        source_message_id=cb.message.message_id)
-        await cb.answer("Акция недоступна", show_alert=True)
+    parsed = cb_ints(cb.data, 3)
+    if parsed is None:
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+    headsets, minutes, promo_id = parsed
+    if (headsets not in HEADSETS_CHOICES or minutes not in MINUTES_CHOICES
+            or not promo_applies(minutes)):
+        await cb.answer(STALE_BUTTON, show_alert=True)
+        return
+    promo = None
+    if promo_id:
+        promo = await db.get_promo(promo_id)
+        if not promo or promo["archived_at"] is not None:
+            # Акцию удалили, пока экран висел: сеанс уже собран, поэтому
+            # возвращаемся на тот же шаг, а не в начало заказа
+            await state.clear()
+            promos = await db.list_promos()
+            if promos:
+                await _promo_screen(cb, db, ui, promos, headsets, minutes)
+            else:
+                await _headsets_screen(cb, db, ui)
+            await cb.answer("Акция недоступна", show_alert=True)
+            return
+    await _confirm_screen(cb, state, db, ui, config, headsets=headsets,
+                          minutes=minutes, promo=promo,
+                          back_cb=f"no:d:{headsets}:{minutes}")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "no:free")
+async def order_free15(cb: CallbackQuery, state: FSMContext, db: Database,
+                       ui: Messenger) -> None:
+    """Бесплатные 15 минут: ни шлемов, ни длительности, ни акции.
+
+    Настройка перечитывается здесь, а не только при отрисовке экрана:
+    выключенный тип не должен оформляться устаревшей кнопкой.
+    """
+    user = await _require_active_admin(cb, state, db, ui)
+    if not user:
+        return
+    await state.clear()
+    settings = await db.get_settings()
+    if not settings["free15_enabled"]:
+        await _headsets_screen(cb, db, ui)
+        await cb.answer("Бесплатный сеанс сейчас недоступен", show_alert=True)
         return
     await state.set_state(NewOrderSG.confirm)
     await state.update_data(
         client_token=uuid.uuid4().hex,
-        kind=KIND_PROMO, headsets=None, minutes=None,
-        promo_id=promo["id"], promo_name=promo["name"],
-        base_price=promo["price"], discount_percent=0, price=promo["price"],
+        kind=KIND_FREE15, headsets=None, minutes=None,
+        promo_id=None, promo_name=None,
+        base_price=0.0, discount_percent=0, price=0.0,
         quoted_at=utcnow_iso(),
     )
     await ui.window(
         cb.message.chat.id,
-        join(h("<b>Новый заказ · Акция · {}</b>", promo["name"]),
-             h("<b>К оплате: {}</b>", fmt_money(promo["price"])),
-             "Примите оплату наличными или переводом и подтвердите"),
-        kb.payment_kb("no:new"),
+        join(h("<b>Новый заказ · {}</b>", FREE15_LABEL),
+             h("<b>К оплате: {}</b>", fmt_money(0)),
+             "Деньги не принимаются: вознаграждение за этот заказ "
+             "не начисляется и место в серии он не занимает",
+             "Подтвердите оформление"),
+        kb.payment_kb("no:new", confirm_text="Оформить заказ"),
         source_message_id=cb.message.message_id,
     )
     await cb.answer()
@@ -528,8 +627,9 @@ async def order_drop(cb: CallbackQuery, state: FSMContext, db: Database,
         cb.message.chat.id,
         join("<b>Заказ не оформлен</b>",
              # Принял администратор деньги или нет — бот не знает и знать
-             # не может; сказать он вправе только о собственной записи
-             h("Сумма {} не записана", fmt_money(price)),
+             # не может; сказать он вправе только о собственной записи.
+             # У бесплатного сеанса суммы нет — и строки о ней тоже
+             h("Сумма {} не записана", fmt_money(price)) if price else "",
              "Выберите раздел"),
         _menu_kb(user) if user else kb.welcome_kb(),
         source_message_id=cb.message.message_id,
@@ -537,6 +637,19 @@ async def order_drop(cb: CallbackQuery, state: FSMContext, db: Database,
     # Не «отменён»: отменяют записанный заказ, а этого не было вовсе —
     # экран и всплывающий ответ обязаны говорить об одном и том же
     await cb.answer("Заказ не оформлен")
+
+
+def _reward_line(order) -> str:
+    """Вознаграждение администратора для уведомления VR Heaven.
+
+    У бесплатного сеанса места в лесенке нет, и «№None в серии» здесь
+    было бы не оговоркой, а неправдой о расчёте.
+    """
+    if order["kind"] == KIND_FREE15:
+        return h("Вознаграждение администратора: {} (бесплатный сеанс)",
+                 fmt_money(order["admin_share"]))
+    return h("Вознаграждение администратора (№{} в серии): {}",
+             order["series_pos"], fmt_money(order["admin_share"]))
 
 
 def _receipt_text(order, tz) -> str:
@@ -596,7 +709,11 @@ async def order_payment(cb: CallbackQuery, state: FSMContext, db: Database,
             await db.audit(
                 tx, Actor.staff(user, cb.from_user.id), "order.create", "order",
                 order["id"],
-                after={"price": order["price"], "admin_share": order["admin_share"],
+                # Тип заказа записан рядом с деньгами: у бесплатного
+                # сеанса нули и пустое место в серии — это норма, и
+                # объясняет её именно он
+                after={"kind": order["kind"], "price": order["price"],
+                       "admin_share": order["admin_share"],
                        "owner_share": order["owner_share"],
                        "series_pos": order["series_pos"]},
             )
@@ -621,31 +738,32 @@ async def order_payment(cb: CallbackQuery, state: FSMContext, db: Database,
                      h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}",
                        user["handle"], order["owner_handle"] or "—",
                        order_row_label(order), fmt_money(order["price"])),
-                     h("Вознаграждение администратора (№{} в серии): {}\n"
-                       "Доля владельца ({}): {}\nОстаток VR Heaven: {}",
-                       order["series_pos"], fmt_money(order["admin_share"]),
-                       fmt_percent(order["owner_percent"]),
-                       fmt_money(order["owner_share"]),
-                       fmt_money(round(order["price"] - order["admin_share"]
-                                       - order["owner_share"], 2)))),
+                     lines(
+                         _reward_line(order),
+                         h("Доля владельца ({}): {}",
+                           fmt_percent(order["owner_percent"]),
+                           fmt_money(order["owner_share"])),
+                         h("Остаток VR Heaven: {}",
+                           fmt_money(round(order["price"] - order["admin_share"]
+                                           - order["owner_share"], 2))))),
                 kind="order_vrheaven", dedup=f"order:{order['id']}:vr")
     await state.clear()
     ui.wake()
-    settings = await db.get_settings()
-    bonus = ""
-    if pc_bonus_applies(settings, order["kind"], order["minutes"]):
-        bonus = h("Начислите клиенту {} баллов на ПК",
-                  int(settings["pc_bonus_points"]))
     note = (notify.devices_note(owner_devices, "Владелец")
             if created and owner and not owner_suspended else "")
+    if order["kind"] == KIND_FREE15:
+        earned = ("Вознаграждение за бесплатный сеанс не начисляется.\n"
+                  "Место в серии он не занимает — следующий заказ идёт "
+                  "по прежней ступени")
+    else:
+        earned = h("Ваше вознаграждение: {} (№{} в серии)\n"
+                   "Следующий заказ серии: {}",
+                   fmt_money(order["admin_share"]), order["series_pos"],
+                   fmt_money(ladder_amount(order["series_pos"] + 1)))
     await ui.window(
         cb.message.chat.id,
         join(h("<b>Заказ №{} записан</b>", order["id"]),
-             bonus,
-             h("Ваше вознаграждение: {} (№{} в серии)\n"
-               "Следующий заказ серии: {}",
-               fmt_money(order["admin_share"]), order["series_pos"],
-               fmt_money(ladder_amount(order["series_pos"] + 1))),
+             earned,
              "Отменить заказ можно в течение 15 минут",
              note),
         kb.order_done_kb(order["id"], cancellable=True),
@@ -655,6 +773,17 @@ async def order_payment(cb: CallbackQuery, state: FSMContext, db: Database,
 
 
 # ------------------------------------------------- Отмена собственного заказа
+
+def _removed_reward(order) -> str:
+    """Строка «вознаграждение снято» — когда его было что снимать.
+
+    У бесплатного сеанса вознаграждения не было вовсе, и «снято 0 ₽»
+    противоречило бы экрану оформления. То же правило, что у доли
+    владельца ниже.
+    """
+    return (h("Вознаграждение {} снято", fmt_money(order["admin_share"]))
+            if order["admin_share"] else "")
+
 
 def _cancel_blocked_text(order) -> str | None:
     """Причина, по которой администратор не может отменить заказ сам.
@@ -785,10 +914,9 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
             own_devices = await notify.to_user(
                 db, tx, user,
                 join("<b>Заказ отменён</b>",
-                     h("Ваш заказ №{} исключён из расчёта долей\n"
-                       "Вознаграждение {} снято\nК выплате: {}",
-                       order_id, fmt_money(order["admin_share"]),
-                       fmt_money(own_total["due_sum"])),
+                     lines(h("Ваш заказ №{} исключён из расчёта долей", order_id),
+                           _removed_reward(order),
+                           h("К выплате: {}", fmt_money(own_total["due_sum"]))),
                      cancelled_by),
                 kind="order_cancelled", dedup=f"cancel:{order_id}:admin",
                 exclude_chat_id=cb.message.chat.id)
@@ -834,9 +962,8 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
     await ui.window(
         cb.message.chat.id,
         join(h("<b>Заказ №{} отменён</b>", order_id),
-             h("Вознаграждение {} снято\nК выплате: {}",
-               fmt_money(order["admin_share"]),
-               fmt_money(own_total["due_sum"])),
+             lines(_removed_reward(order),
+                   h("К выплате: {}", fmt_money(own_total["due_sum"]))),
              notify.devices_note(owner_devices, "Владелец") if owner_devices else "",
              h("Ваши другие устройства уведомлены: {}", own_devices)
              if own_devices else ""),

@@ -11,7 +11,14 @@
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from pricing import WEEKDAY_NAMES, day_enabled, fmt_days, order_label, order_row_label
+from pricing import (
+    FREE15_LABEL,
+    WEEKDAY_NAMES,
+    day_enabled,
+    fmt_days,
+    order_label,
+    order_row_label,
+)
 from utils import fmt_dt, fmt_money, fmt_percent, fmt_signed_money, fmt_time_min
 
 # --------------------------------------------------------------------- Общие
@@ -211,8 +218,8 @@ def fmt_discount_time(settings: dict) -> str:
 
 def settings_menu_kb(settings: dict, promo_count: int) -> InlineKeyboardMarkup:
     """Четыре раздела, каждый — отдельное решение бизнеса, а не полка
-    для однотипных кнопок: сколько стоит сеанс, когда дешевле, что идёт
-    по своей цене и что получает клиент сверх сеанса."""
+    для однотипных кнопок: сколько стоит сеанс, когда дешевле, что дарим
+    призом и раздаём ли мы сеансы даром."""
     kb = InlineKeyboardBuilder()
     kb.button(text="Цены сеансов", callback_data="st:prices")
     kb.button(
@@ -223,9 +230,9 @@ def settings_menu_kb(settings: dict, promo_count: int) -> InlineKeyboardMarkup:
     )
     kb.button(text=f"Акции ({promo_count})", callback_data="pr:menu")
     kb.button(
-        text=f"ПК-бонус — {'вкл' if settings['pc_bonus_enabled'] else 'выкл'}"
-             f" · {int(settings['pc_bonus_points'])} баллов",
-        callback_data="st:pc",
+        text=f"{FREE15_LABEL} — "
+             f"{'вкл' if settings['free15_enabled'] else 'выкл'}",
+        callback_data="st:free",
     )
     kb.button(text="В меню", callback_data="am")
     kb.adjust(1)
@@ -264,14 +271,13 @@ def discount_kb(settings: dict) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def pc_bonus_kb(settings: dict) -> InlineKeyboardMarkup:
+def free15_kb(settings: dict) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(
-        text=f"ПК-бонус — {'вкл' if settings['pc_bonus_enabled'] else 'выкл'}",
-        callback_data="st:tgl:pc_bonus_enabled",
+        text=f"{FREE15_LABEL} — "
+             f"{'вкл' if settings['free15_enabled'] else 'выкл'}",
+        callback_data="st:tgl:free15_enabled",
     )
-    kb.button(text=f"Баллы — {int(settings['pc_bonus_points'])}",
-              callback_data="st:set:pc_bonus_points")
     kb.button(text="Назад", callback_data="st:menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -289,12 +295,11 @@ def discount_days_kb(settings: dict) -> InlineKeyboardMarkup:
 
 
 def promos_kb(promos) -> InlineKeyboardMarkup:
-    """Нажатие на акцию открывает её экран — цену можно изменить,
-    а удаление остаётся отдельным явным действием."""
+    """Нажатие на акцию открывает её экран: удаление остаётся отдельным
+    явным действием, а не срабатывает от нажатия в списке."""
     kb = InlineKeyboardBuilder()
     for p in promos:
-        kb.button(text=f"{p['name']} — {fmt_money(p['price'])}",
-                  callback_data=f"pr:open:{p['id']}")
+        kb.button(text=p["name"], callback_data=f"pr:open:{p['id']}")
     kb.button(text="Добавить акцию", callback_data="pr:add")
     kb.button(text="Назад", callback_data="st:menu")
     kb.adjust(1)
@@ -302,8 +307,8 @@ def promos_kb(promos) -> InlineKeyboardMarkup:
 
 
 def promo_card_kb(promo) -> InlineKeyboardMarkup:
+    """Карточка акции: править нечего — у акции есть только имя."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="Изменить цену", callback_data=f"pr:price:{promo['id']}")
     kb.button(text="Удалить акцию", callback_data=f"pr:del:{promo['id']}")
     kb.button(text="К списку акций", callback_data="pr:menu")
     kb.adjust(1)
@@ -379,13 +384,33 @@ def to_staff_menu_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def order_kind_kb(promos) -> InlineKeyboardMarkup:
-    """Выбор типа заказа: стандартный сеанс и действующие акции."""
+def order_kind_kb() -> InlineKeyboardMarkup:
+    """Первый шаг заказа: обычный сеанс или бесплатные 15 минут.
+
+    Показывается, только когда бесплатный сеанс включён: экран
+    с единственным вариантом — трение на каждом заказе.
+    """
     kb = InlineKeyboardBuilder()
     kb.button(text="Стандартный сеанс", callback_data="no:std")
+    kb.button(text=FREE15_LABEL, callback_data="no:free")
+    kb.button(text="Отмена", callback_data="sm")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def promo_pick_kb(promos, headsets: int, minutes: int) -> InlineKeyboardMarkup:
+    """Призы колеса фортуны к выбранному сеансу; «Без акции» — приза нет.
+
+    Шлемы и длительность уже выбраны и едут в кнопке: акция принадлежит
+    заказу, а не заменяет его состав. Денег в кнопке нет и быть не может —
+    у акции их нет вовсе.
+    """
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Без акции", callback_data=f"no:p:{headsets}:{minutes}:0")
     for p in promos:
-        kb.button(text=f"Акция · {p['name']} — {fmt_money(p['price'])}",
-                  callback_data=f"no:promo:{p['id']}")
+        kb.button(text=f"Акция · {p['name']}",
+                  callback_data=f"no:p:{headsets}:{minutes}:{p['id']}")
+    kb.button(text="Назад", callback_data=f"no:h:{headsets}")
     kb.button(text="Отмена", callback_data="sm")
     kb.adjust(1)
     return kb.as_markup()
@@ -412,10 +437,15 @@ def duration_kb(headsets: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def payment_kb(back_cb: str) -> InlineKeyboardMarkup:
-    """Момент приёма денег: подтверждение и явный отказ от заказа."""
+def payment_kb(back_cb: str,
+               confirm_text: str = "Оплата получена") -> InlineKeyboardMarkup:
+    """Момент приёма денег: подтверждение и явный отказ от заказа.
+
+    У бесплатного сеанса денег не принимают, поэтому подпись
+    подтверждения задаётся вызывающим.
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(text="Оплата получена", callback_data="no:ok")
+    kb.button(text=confirm_text, callback_data="no:ok")
     kb.button(text="Назад", callback_data=back_cb)
     kb.button(text="Отменить заказ", callback_data="no:drop")
     kb.adjust(1)

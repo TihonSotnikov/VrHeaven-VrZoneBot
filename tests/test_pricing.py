@@ -1,4 +1,4 @@
-"""Расчёт цены: базовые цены, скидка по расписанию, округление, ПК-бонус;
+"""Расчёт цены: базовые цены, скидка по расписанию, округление, акции;
 лесенка вознаграждения и 12-часовые серии."""
 
 from datetime import datetime, timedelta
@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 from db import SETTINGS_DEFAULTS
 from pricing import (
+    FREE15_LABEL,
+    KIND_FREE15,
     KIND_GROUP,
     KIND_PROMO,
     KIND_STANDARD,
@@ -20,7 +22,7 @@ from pricing import (
     normalize_reset,
     order_label,
     order_row_label,
-    pc_bonus_applies,
+    promo_applies,
     quote,
     round10,
     series_start,
@@ -54,8 +56,7 @@ def test_weekday_discount_applies_on_monday_morning():
 
 
 def test_all_standard_prices_discounted_in_discount_hours():
-    """Скидку получают все стандартные сеансы — длительность не важна;
-    ПК-бонус на цену не влияет."""
+    """Скидку получают все стандартные сеансы — длительность не важна."""
     s = settings()
     expected = {(1, 15): 160, (1, 30): 240, (1, 60): 400,
                 (2, 15): 280, (2, 30): 400, (2, 60): 640}
@@ -229,36 +230,46 @@ def test_order_label():
                             "promo_name": None}) == "1 шлем · 30 мин"
 
 
-def test_pc_bonus_does_not_touch_the_price():
-    """ПК-бонус — только напоминание: цена от него не зависит вовсе,
-    и со скидкой он уживается на одном заказе."""
-    with_bonus = settings()
-    without_bonus = settings(pc_bonus_enabled=0)
+def test_order_label_keeps_the_session_when_a_promo_belongs_to_it():
+    """Акция принадлежит заказу: состав сеанса она дополняет, а не прячет."""
+    assert (order_label(KIND_STANDARD, 2, 60, "День рождения")
+            == "2 шлема · 60 мин · Акция · День рождения")
+    assert order_row_label({"kind": "standard", "headsets": 1, "minutes": 30,
+                            "promo_name": "3=4"}) == "1 шлем · 30 мин · Акция · 3=4"
+
+
+def test_free15_label_names_the_type():
+    assert order_label(KIND_FREE15) == FREE15_LABEL
+    assert order_row_label({"kind": KIND_FREE15, "headsets": None,
+                            "minutes": None, "promo_name": None}) == FREE15_LABEL
+
+
+def test_promo_is_offered_from_thirty_minutes():
+    """Порог «от 30 минут», а не перечень длительностей."""
+    assert promo_applies(30)
+    assert promo_applies(60)
+    assert promo_applies(45)
+    assert not promo_applies(15)
+    assert not promo_applies(29)
+    # длительности у заказа может не быть — на None проверка не падает
+    assert not promo_applies(None)
+
+
+def test_quote_knows_nothing_about_promos():
+    """Приз колеса фортуны в цену сеанса не входит никак.
+
+    Проверяется на уровне подписи: у `quote` нет параметра для акции, а
+    у самой акции нет денежной величины. Цена зависит ровно от четырёх
+    вещей — настройки, момент, шлемы, длительность.
+    """
+    import inspect
+
+    assert list(inspect.signature(quote).parameters) == [
+        "settings", "now", "headsets", "minutes"]
     for now in (MONDAY_MORNING, SATURDAY):            # в скидку и вне её
         for minutes in MINUTES_CHOICES:
-            assert (quote(with_bonus, now, 1, minutes)
-                    == quote(without_bonus, now, 1, minutes)), (now, minutes)
-    # 30 минут в часы скидки: и скидка в цене, и напоминание о баллах
-    q = quote(with_bonus, MONDAY_MORNING, 1, 30)
-    assert q.discount_percent == 20 and q.price == 240
-    assert pc_bonus_applies(with_bonus, KIND_STANDARD, 30)
-
-
-def test_pc_bonus_reminder_rules():
-    """Напоминание — на сеансах от 30 минут; заказы по акции без баллов."""
-    s = settings()
-    assert pc_bonus_applies(s, KIND_STANDARD, 30)
-    assert pc_bonus_applies(s, KIND_STANDARD, 60)
-    assert not pc_bonus_applies(s, KIND_STANDARD, 15)
-    assert not pc_bonus_applies(s, KIND_PROMO, None)
-    assert not pc_bonus_applies(s, KIND_GROUP, None)
-    assert not pc_bonus_applies(settings(pc_bonus_enabled=0), KIND_STANDARD, 30)
-    # порог «от 30 минут», а не перечень длительностей
-    assert not pc_bonus_applies(s, KIND_STANDARD, 29)
-    assert pc_bonus_applies(s, KIND_STANDARD, 45)
-    assert pc_bonus_applies(s, KIND_STANDARD, 90)
-    # длительности у акции нет — на None проверка не падает
-    assert not pc_bonus_applies(s, KIND_STANDARD, None)
+            q = quote(settings(), now, 1, minutes)
+            assert q.price % 10 == 0, (now, minutes)
 
 
 # ------------------------------------------------- Лесенка вознаграждения

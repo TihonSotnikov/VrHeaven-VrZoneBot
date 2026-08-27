@@ -69,6 +69,41 @@ async def test_duplicate_series_step_is_reported(db):
     assert any("одно место" in p for p in problems)
 
 
+async def test_free_session_passes_every_check(db):
+    """Нули бесплатного сеанса — норма, а не расхождение: ни лесенка,
+    ни доля владельца на нём не спотыкаются."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=790, admin_share=50, series_pos=1)
+    await make_order(db, admin, owner, kind="free15", price=0, headsets=None,
+                     minutes=None, admin_share=0, series_pos=None)
+    await make_order(db, admin, owner, price=300, admin_share=100, series_pos=2)
+    assert check_database(db.path) == []
+
+
+async def test_free_session_that_earned_money_is_reported(db):
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, kind="free15", price=0, headsets=None,
+                     minutes=None, admin_share=0, series_pos=None)
+    async with db.write() as tx:
+        await tx.execute("UPDATE orders SET price = 300, admin_share = 50")
+    problems = check_database(db.path)
+    assert any("бесплатный сеанс с ценой" in p for p in problems)
+
+
+async def test_free_session_that_took_a_series_step_is_reported(db):
+    """Даровая ступень подняла бы вознаграждение за следующий заказ."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, kind="free15", price=0, headsets=None,
+                     minutes=None, admin_share=0, series_pos=None)
+    async with db.write() as tx:
+        await tx.execute("UPDATE orders SET series_pos = 1, admin_share = 50")
+    problems = check_database(db.path)
+    assert any("занял место" in p for p in problems)
+
+
 async def test_duplicate_active_handle_is_reported(db):
     await create_owner(db, "club")
     async with db.write() as tx:

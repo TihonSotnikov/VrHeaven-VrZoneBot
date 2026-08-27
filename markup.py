@@ -165,14 +165,20 @@ class Report:
 
         Длинный отчёт режется не с конца: в конце стоят итоги — «К выплате»
         и «Остаток VR Heaven», ради которых отчёт и открывают. Обрезается
-        середина (строки таблиц), последний блок остаётся целым.
+        середина — строки таблиц, то есть расшифровка; всё, что стоит
+        после последней таблицы, остаётся целым. Итог поэтому переживает
+        обрезку, где бы он ни стоял: и в подвале сводки, и под таблицами
+        статистики администратора. Отчёт без таблиц режется как прежде —
+        целым остаётся последний блок.
         """
         separator = "" if rich else "\n\n"
         parts = [f"<p><b>{esc(self.title)}</b></p>" if rich
                  else f"<b>{esc(self.title)}</b>"]
+        tables = []
         for block in self.blocks:
             if isinstance(block, Table):
                 parts.append(table_html(block) if rich else pre_table(block))
+                tables.append(len(parts) - 1)
             elif rich:
                 parts.append(f"<p>{breaks(block)}</p>")
             else:
@@ -180,12 +186,13 @@ class Report:
         text = separator.join(parts)
         if len(text) <= limit:
             return text
-        tail = parts[-1]
-        head = separator.join(parts[:-1])
+        cut = tables[-1] + 1 if tables else len(parts) - 1
+        tail = separator.join(parts[cut:])
         room = limit - len(tail) - len(separator)
-        if room <= len(TRUNCATION_MARKER):    # итоги сами длиннее лимита
+        # хвоста нет вовсе (отчёт кончается таблицей) или он сам длиннее лимита
+        if not tail or room <= len(TRUNCATION_MARKER):
             return clamp(text, limit)
-        return clamp(head, room) + separator + tail
+        return clamp(separator.join(parts[:cut]), room) + separator + tail
 
 
 def table_html(table: Table) -> str:

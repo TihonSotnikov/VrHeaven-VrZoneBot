@@ -107,6 +107,34 @@ async def test_cancelled_order_does_not_hold_its_step(db, ui, config, monkeypatc
     assert (await db.get_order(2))["series_pos"] == 1
 
 
+async def test_free_session_stays_out_of_the_series_even_after_a_cancellation(
+        db, ui, config, monkeypatch):
+    """Бесплатный сеанс не занимает ступень и не мешает счёту после отмены:
+    проверка серий над файлом базы обязана остаться чистой."""
+    from handlers.staff import order_free15
+    from invariants import check_database
+
+    await _admin(db)
+    async with db.write() as tx:
+        await db.set_setting(tx, "free15_enabled", 1)
+    tz = config.tz
+    _freeze(monkeypatch, datetime(2026, 8, 12, 11, 0, tzinfo=tz))
+    state = make_state(db, ADMIN_CHAT)
+    await _place(db, ui, config, state)                       # №1, ступень 1
+    await order_free15(fake_cb("no:free", message_id=WINDOW), state, db, ui)
+    await order_payment(fake_cb("no:ok", message_id=WINDOW), state, db, ui, config)
+    await _place(db, ui, config, state)                       # №3, ступень 2
+    async with db.write() as tx:
+        await db.cancel_order(tx, 1, for_self=False)          # ступень 1 освободилась
+    # живым остался один платный заказ, поэтому следующий снова второй —
+    # ступень 2 достаётся двум заказам одной серии, и это законно (SPEC §3)
+    await _place(db, ui, config, state)
+
+    positions = [o["series_pos"] for o in await db.export_orders()]
+    assert positions == [1, None, 2, 2]
+    assert check_database(db.path) == []
+
+
 async def test_reset_screen_accepts_time_pair_and_dash(db, ui):
     admin = await create_admin(db)
     await set_window(db, VR_CHAT, WINDOW)

@@ -28,10 +28,13 @@ write-локом, что и вставка заказа; повторная от
                  пользователь», на этом держится авторизация.
   orders       — заказы VR-сеансов; цена и все начисления заморожены в
                  момент оформления. client_token делает оформление
-                 идемпотентным.
-  promos       — акции (имя + цена), мягкое удаление archived_at;
-                 name_folded + частичный UNIQUE обеспечивают уникальность
-                 имени среди действующих с учётом кириллицы.
+                 идемпотентным. Выбранная акция принадлежит заказу
+                 (promo_id + снимок promo_name).
+  promos       — акции: призы колеса фортуны, у которых есть только имя.
+                 Мягкое удаление archived_at; name_folded + частичный
+                 UNIQUE обеспечивают уникальность имени среди действующих
+                 с учётом кириллицы. Денежной величины у акции нет —
+                 в деньгах заказа она не участвует ничем.
   bonuses      — бонусы и удержания администраторам.
   payouts      — выплаты; получатель — владелец или администратор.
   settings     — числовые настройки; отсутствующий ключ = значение
@@ -56,7 +59,7 @@ from dataclasses import dataclass
 import aiosqlite
 
 from migrations import apply_migrations
-from pricing import ladder_amount, split
+from pricing import KIND_FREE15, ladder_amount, split
 from utils import utcnow_iso
 
 log = logging.getLogger(__name__)
@@ -77,8 +80,7 @@ SETTINGS_DEFAULTS: dict[str, float] = {
     "discount_days": 0b0011111,       # маска дней недели: Пн–Пт
     "discount_start_min": 10 * 60,    # начало скидки — 10:00
     "discount_end_min": 16 * 60,      # конец скидки — 16:00
-    "pc_bonus_enabled": 1,
-    "pc_bonus_points": 100,
+    "free15_enabled": 1,              # доступны ли бесплатные 15 минут
 }
 
 # --------------------------------------------- Остаток VR Heaven: одно место
@@ -531,6 +533,11 @@ class Database:
         в ней: место без границы нельзя проверить, а выводить границу из
         текущей настройки нельзя — смена времени сбросов перекроила бы
         прошлые серии задним числом.
+
+        Бесплатные 15 минут места в серии не занимают: вознаграждения за
+        такой заказ нет, а занятая ступень подняла бы вознаграждение за
+        следующий заказ. Поэтому у него нет ни места, ни границы серии, и
+        в счёт мест он не входит — ни своим, ни чужим.
         """
         row = await tx.fetchone(
             "SELECT * FROM orders WHERE client_token = ?", (client_token,)
@@ -538,14 +545,19 @@ class Database:
         if row is not None:
             return await self.get_order(order_id=row["id"], tx=tx), False
 
-        counted = await tx.fetchone(
-            "SELECT COUNT(*) AS n FROM orders WHERE admin_id = ?"
-            " AND cancelled_at IS NULL AND created_at >= ?",
-            (admin_id, series_since_iso),
-        )
-        series_pos = counted["n"] + 1
+        if kind == KIND_FREE15:
+            series_pos, series_since, admin_amount = None, None, 0.0
+        else:
+            counted = await tx.fetchone(
+                "SELECT COUNT(*) AS n FROM orders WHERE admin_id = ?"
+                " AND cancelled_at IS NULL AND kind <> ? AND created_at >= ?",
+                (admin_id, KIND_FREE15, series_since_iso),
+            )
+            series_pos = counted["n"] + 1
+            series_since = series_since_iso
+            admin_amount = ladder_amount(series_pos)
         admin_share, owner_share, _ = split(
-            price, ladder_amount(series_pos), 0 if owner_suspended else owner_percent
+            price, admin_amount, 0 if owner_suspended else owner_percent
         )
         cur = await tx.execute(
             "INSERT INTO orders (client_token, admin_id, owner_id, kind, headsets,"
@@ -558,7 +570,7 @@ class Database:
             " ON CONFLICT(client_token) WHERE client_token IS NOT NULL DO NOTHING",
             (client_token, admin_id, owner_id, kind, headsets, minutes,
              promo_id, promo_name, base_price, discount_percent, price,
-             admin_percent, admin_share, series_pos, series_since_iso,
+             admin_percent, admin_share, series_pos, series_since,
              0 if owner_suspended else owner_percent, owner_share,
              int(owner_suspended), quoted_at, utcnow_iso()),
         )
@@ -624,11 +636,15 @@ class Database:
         return Cancellation(done=True, debt=debt, bonus_id=bonus_id)
 
     async def count_series_orders(self, admin_id: int, since_iso: str) -> int:
-        """Неотменённые заказы администратора с начала его текущей серии."""
+        """Неотменённые заказы администратора с начала его текущей серии.
+
+        Считается ровно то же, что считает `create_order`, выдавая место
+        в лесенке: бесплатные 15 минут в серию не входят.
+        """
         row = await self.fetchone(
             "SELECT COUNT(*) AS n FROM orders WHERE admin_id = ?"
-            " AND cancelled_at IS NULL AND created_at >= ?",
-            (admin_id, since_iso),
+            " AND cancelled_at IS NULL AND kind <> ? AND created_at >= ?",
+            (admin_id, KIND_FREE15, since_iso),
         )
         return row["n"]
 
@@ -844,20 +860,13 @@ class Database:
     async def get_promo(self, promo_id: int) -> aiosqlite.Row | None:
         return await self.fetchone("SELECT * FROM promos WHERE id = ?", (promo_id,))
 
-    async def create_promo(self, tx: Tx, name: str, price: float) -> int:
+    async def create_promo(self, tx: Tx, name: str) -> int:
+        """Заводит акцию. У акции есть только имя: приз — это текст."""
         cur = await tx.execute(
-            "INSERT INTO promos (name, name_folded, price, created_at)"
-            " VALUES (?, ?, ?, ?)",
-            (name, name.casefold(), price, utcnow_iso()),
+            "INSERT INTO promos (name, name_folded, created_at) VALUES (?, ?, ?)",
+            (name, name.casefold(), utcnow_iso()),
         )
         return cur.lastrowid
-
-    async def set_promo_price(self, tx: Tx, promo_id: int, price: float) -> bool:
-        cur = await tx.execute(
-            "UPDATE promos SET price = ? WHERE id = ? AND archived_at IS NULL",
-            (price, promo_id),
-        )
-        return cur.rowcount > 0
 
     async def promo_name_taken(self, name: str) -> bool:
         """Есть ли действующая акция с таким именем.

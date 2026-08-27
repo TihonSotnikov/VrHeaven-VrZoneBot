@@ -71,9 +71,9 @@ async def _scene(db):
 
 # ------------------------------------------------------- Моя статистика
 
-async def test_admin_statistics_lead_with_the_payable(db):
-    """Порядок: вознаграждение → бонусы → итог. Итог наверху ещё и
-    переживает обрезку длинного отчёта (markup.Report.to_html)."""
+async def test_admin_statistics_close_with_the_payable(db):
+    """Сверху — названные таблицы, снизу — три величины: вознаграждение →
+    бонусы → итог. Слагаемые стоят рядом с итогом, а не через полэкрана."""
     owner = await create_owner(db)
     admin = await create_admin(db, owner)
     await make_order(db, admin, owner, price=700)
@@ -84,8 +84,28 @@ async def test_admin_statistics_lead_with_the_payable(db):
 
     assert "Вознаграждение за заказы: 50 ₽" in html
     assert "Бонусы и удержания: +200 ₽" in html
-    assert "<b>К выплате: 250 ₽</b>" in html
-    assert html.index("К выплате") < html.index("<pre>"), "итог выше таблицы"
+    assert "К выплате: 250 ₽" in html
+    assert html.rindex("</pre>") < html.index("К выплате"), "итог ниже таблиц"
+    assert html.index("<b>Заказы</b>") < html.index("<pre>"), "таблица названа"
+    assert (html.index("<b>Бонусы и удержания</b>")
+            < html.rindex("<pre>")), "вторая таблица названа"
+
+
+async def test_admin_statistics_keep_the_totals_unbolded(db):
+    """Выделение осталось у подписей таблиц: величины внизу его не носят,
+    иначе одни и те же слова читаются то заголовком, то суммой."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700)
+    async with db.write() as tx:
+        await db.create_bonus(tx, admin["id"], 500.0, "за инициативу")
+    html = await _html(await reports.admin_period(db, admin, TZ))
+
+    bold = re.findall(r"<b>(.*?)</b>", html)
+    for label in ("Вознаграждение за заказы", "Бонусы и удержания: ",
+                  "К выплате"):
+        assert not [b for b in bold if label in b], f"{label} выделено"
+    assert "Бонусы и удержания" in bold, "подпись таблицы осталась выделенной"
 
 
 async def test_admin_statistics_hide_turnover_and_order_prices(db):
@@ -134,7 +154,7 @@ async def test_admin_statistics_explain_a_negative_balance(db):
     async with db.write() as tx:
         await db.create_bonus(tx, admin["id"], -300.0, "недостача")
     html = await _html(await reports.admin_period(db, admin, TZ))
-    assert "<b>К выплате: −250 ₽</b>" in html
+    assert "К выплате: −250 ₽" in html
     assert "удержание перейдёт в следующий период" in html
 
 
@@ -153,10 +173,43 @@ async def test_owner_period_shows_only_the_owner_share(db):
     await make_order(db, admin, owner, price=700)
     html = await _html(await reports.owner_period(db, owner, TZ))
 
-    assert "<b>К выплате: 210 ₽</b>" in html
+    assert "К выплате: 210 ₽" in html
     assert "Ваша доля" in html
     assert "Оборот" not in html and "оборот" not in html
     assert "700" not in html, "цена заказа — не доля владельца"
+
+
+async def test_owner_period_closes_with_the_payable(db):
+    """Тот же порядок, что в статистике администратора: названная
+    таблица — расшифровка, итог — под ней и без выделения."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700)
+    html = await _html(await reports.owner_period(db, owner, TZ))
+
+    assert html.index("<b>Заказы</b>") < html.index("<pre>"), "таблица названа"
+    assert html.rindex("</pre>") < html.index("К выплате"), "итог ниже таблицы"
+    assert "<b>К выплате" not in html
+
+
+async def test_busy_admin_statistics_still_keeps_its_total(db):
+    """Итог внизу не должен стоить администратору обрезки: режутся строки
+    таблиц, всё после последней таблицы остаётся целым."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    for _ in range(reports.MAX_TABLE_ROWS + 5):
+        await make_order(db, admin, owner, price=700, series_pos=5)
+    async with db.write() as tx:
+        for i in range(reports.MAX_TABLE_ROWS):
+            await db.create_bonus(tx, admin["id"], 100.0, f"смена {i} " + "х" * 180)
+    report = await reports.admin_period(db, admin, TZ)
+
+    for rich in (True, False):
+        html = report.to_html(rich=rich)
+        assert len(html) <= TEXT_LIMIT
+        assert len(html) > TEXT_LIMIT - 400, "отчёт и правда не помещался целиком"
+        assert f"К выплате: {fmt_money(30 * 250 + 25 * 100)}" in html
+        validate_html(html)
 
 
 # --------------------------------------------------- Мои администраторы

@@ -150,7 +150,7 @@ create table orders(id integer primary key,
 create table payouts(id integer primary key, user_id integer, amount real,
   orders_count integer, created_at text);
 create table promos(id integer primary key, name text, name_folded text,
-  price real, archived_at text, created_at text);
+  archived_at text, created_at text);
 create table bonuses(id integer primary key, admin_id integer, amount real,
   comment text, payout_id integer, cancelled_at text, created_at text);
 insert into users values(1,'admin','a','A','','x',0,null,null,1,null,'2026-01-01T00:00:00+00:00');

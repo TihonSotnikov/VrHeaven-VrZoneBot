@@ -35,7 +35,14 @@ from markup import (
     lines,
 )
 from messaging import Messenger, document_payload
-from pricing import WEEKDAY_NAMES, fmt_days, normalize_reset, order_row_label, toggle_day
+from pricing import (
+    FREE15_LABEL,
+    WEEKDAY_NAMES,
+    fmt_days,
+    normalize_reset,
+    order_row_label,
+    toggle_day,
+)
 from roster import is_bootstrap, is_super_admin, super_admin_ids
 from utils import (
     fmt_dt,
@@ -69,13 +76,13 @@ SETTING_TITLES = {
     "price_2_60": "Цена · 2 шлема · 60 мин",
     "discount_percent": "Размер скидки",
     "discount_time": "Время скидки",
-    "pc_bonus_points": "Баллы ПК-бонуса",
 }
-TOGGLE_KEYS = {"discount_enabled", "pc_bonus_enabled"}
-SETTING_SCREENS = {
-    "discount_percent": "st:disc", "discount_time": "st:disc",
-    "pc_bonus_points": "st:pc",
-}
+# Экран, на который возвращает «Отмена» ввода настройки
+SETTING_SCREENS = {"discount_percent": "st:disc", "discount_time": "st:disc"}
+# Переключатели и экран каждого: список допустимых ключей выводится отсюда,
+# чтобы переключатель без своего экрана нельзя было завести по недосмотру
+TOGGLE_SCREENS = {"discount_enabled": "st:disc", "free15_enabled": "st:free"}
+TOGGLE_KEYS = frozenset(TOGGLE_SCREENS)
 
 
 class SuperAdminFilter(Filter):
@@ -115,11 +122,6 @@ class EditSettingSG(StatesGroup):
 
 class AddPromoSG(StatesGroup):
     name = State()
-    price = State()
-
-
-class EditPromoPriceSG(StatesGroup):
-    value = State()
 
 
 class AddBonusSG(StatesGroup):
@@ -355,8 +357,9 @@ async def order_cancel_confirm(cb: CallbackQuery, db: Database, ui: Messenger,
                 total = await db.admin_unpaid_total(admin["id"])
                 # Снять можно только то, что ещё не выплачено: про уже
                 # выплаченное вознаграждение говорит debt_line, и второй
-                # строки о той же сумме быть не должно
-                removed = "" if done.debt else h(
+                # строки о той же сумме быть не должно. У бесплатного
+                # сеанса вознаграждения не было вовсе — снимать нечего
+                removed = "" if done.debt or not order["admin_share"] else h(
                     "\nВознаграждение {} снято", fmt_money(order["admin_share"]))
                 count = await notify.to_user(
                     db, tx, admin,
@@ -1472,11 +1475,12 @@ async def payout_confirm(cb: CallbackQuery, db: Database, ui: Messenger) -> None
 
 PROMOS_TEXT = join(
     "<b>Акции</b>",
-    "Акция — это название и цена; администраторам действующие акции "
-    "доступны кнопками в новом заказе. Акция идёт по своей цене: скидка "
-    "на неё не действует, ПК-бонус не начисляется.",
-    "Заказ по акции — обычный заказ серии: вознаграждение администратора "
-    "считается по лесенке, доля владельца — по его проценту.",
+    "Акция — приз колеса фортуны, и вся акция — это её название. "
+    "Администратор отмечает её в заказе после шлемов и длительности, "
+    "на сеансах от 30 минут: так видно, какой приз за какой заказ выдан.",
+    "Денег у акции нет. На цену сеанса, скидку, вознаграждение "
+    "администратора, долю владельца и выплаты она не влияет ничем — "
+    "это признак заказа для учёта и статистики.",
 )
 
 
@@ -1484,7 +1488,7 @@ async def _promos_screen(ui: Messenger, db: Database, chat_id: int,
                          source_message_id: int | None = None) -> None:
     promos = await db.list_promos()
     text = join(PROMOS_TEXT,
-                "Нажмите акцию, чтобы изменить цену или удалить её"
+                "Нажмите акцию, чтобы удалить её"
                 if promos else "Действующих акций сейчас нет")
     await ui.window(chat_id, text, kb.promos_kb(promos),
                     source_message_id=source_message_id)
@@ -1509,8 +1513,9 @@ async def promo_open(cb: CallbackQuery, state: FSMContext, db: Database,
         return
     await _window(cb, ui,
                   join(h("<b>Акция · {}</b>", promo["name"]),
-                       h("Цена: {}", fmt_money(promo["price"])),
-                       "Изменение цены действует только на новые заказы"),
+                       "Приз колеса фортуны. Никаких денег у акции нет: "
+                       "на цену сеанса и на вознаграждение администратора "
+                       "она не влияет"),
                   kb.promo_card_kb(promo))
     await cb.answer()
 
@@ -1548,120 +1553,14 @@ async def promo_add_name(message: Message, state: FSMContext, db: Database,
                              "Укажите другое название"),
                         kb.cancel_kb("pr:menu"))
         return
-    await state.update_data(name=name)
-    await state.set_state(AddPromoSG.price)
-    await ui.window(message.chat.id,
-                    join(h("<b>Новая акция · {}</b>", name),
-                         "Введите цену акции в рублях"),
-                    kb.cancel_kb("pr:menu"))
-
-
-@router.message(AddPromoSG.price, F.text)
-async def promo_add_price(message: Message, state: FSMContext, db: Database,
-                          ui: Messenger) -> None:
-    await ui.drop_user_message(message)
-    data = await state.get_data()
-    if "name" not in data:
-        return
-    price = parse_amount(message.text)
-    if price is None:
-        await ui.window(message.chat.id,
-                        join(h("<b>Новая акция · {}</b>", data["name"]),
-                             "Цена — положительное число",
-                             "Введите цену ещё раз"),
-                        kb.cancel_kb("pr:menu"))
-        return
+    # Имя — вся акция целиком, поэтому она заводится прямо здесь:
+    # спрашивать больше нечего
     await state.clear()
-    if await db.promo_name_taken(data["name"]):
-        await _promos_screen(ui, db, message.chat.id)
-        return
     async with db.write() as tx:
-        promo_id = await db.create_promo(tx, data["name"], price)
+        promo_id = await db.create_promo(tx, name)
         await db.audit(tx, _actor(message), "promo.create", "promo", promo_id,
-                       after={"name": data["name"], "price": price})
+                       after={"name": name})
     await _promos_screen(ui, db, message.chat.id)
-
-
-@router.callback_query(F.data.startswith("pr:price:"))
-async def promo_price_ask(cb: CallbackQuery, state: FSMContext, db: Database,
-                          ui: Messenger) -> None:
-    promo_id = cb_int(cb.data)
-    promo = await db.get_promo(promo_id) if promo_id else None
-    if not promo or promo["archived_at"] is not None:
-        await cb.answer("Акция уже удалена", show_alert=True)
-        return
-    await state.set_state(EditPromoPriceSG.value)
-    await state.update_data(promo_id=promo["id"], name=promo["name"])
-    await _window(cb, ui,
-                  join(h("<b>Цена акции · {}</b>", promo["name"]),
-                       h("Текущая цена: {}", fmt_money(promo["price"])),
-                       "Введите новую цену в рублях. Уже оформленные заказы "
-                       "сохраняют свою цену"),
-                  kb.cancel_kb(f"pr:open:{promo['id']}"))
-    await cb.answer()
-
-
-@router.message(EditPromoPriceSG.value, F.text)
-async def promo_price_set(message: Message, state: FSMContext, db: Database,
-                          ui: Messenger) -> None:
-    await ui.drop_user_message(message)
-    data = await state.get_data()
-    if "promo_id" not in data:
-        return
-    price = parse_amount(message.text)
-    if price is None:
-        await ui.window(message.chat.id,
-                        join(h("<b>Цена акции · {}</b>", data["name"]),
-                             "Цена — положительное число",
-                             "Введите цену ещё раз"),
-                        kb.cancel_kb(f"pr:open:{data['promo_id']}"))
-        return
-    promo = await db.get_promo(data["promo_id"])
-    if not promo or promo["archived_at"] is not None:
-        await state.clear()
-        await _promos_screen(ui, db, message.chat.id)
-        return
-    if promo["price"] > 0 and (price >= promo["price"] * 3
-                               or price <= promo["price"] / 3):
-        # Тот же запрет, что и у цен сеансов: цену акции платит клиент
-        # у прилавка, и лишний ноль не должен переписать её молча
-        await state.update_data(pending=price)
-        await ui.window(
-            message.chat.id,
-            join(h("<b>Цена акции · {}</b>", promo["name"]),
-                 h("Было: {}\nСтанет: {}", fmt_money(promo["price"]),
-                   fmt_money(price)),
-                 "Цена меняется более чем втрое. Подтвердите изменение"),
-            kb.confirm_kb("pr:priceok", f"pr:open:{promo['id']}"))
-        return
-    await state.clear()
-    await _apply_promo_price(message, db, ui, promo, price, message.chat.id)
-
-
-async def _apply_promo_price(event, db: Database, ui: Messenger, promo,
-                             price: float, chat_id: int,
-                             source_message_id: int | None = None) -> None:
-    async with db.write() as tx:
-        await db.set_promo_price(tx, promo["id"], price)
-        await db.audit(tx, _actor(event), "promo.price", "promo", promo["id"],
-                       before={"price": promo["price"]}, after={"price": price})
-    await _promos_screen(ui, db, chat_id, source_message_id)
-
-
-@router.callback_query(EditPromoPriceSG.value, F.data == "pr:priceok")
-async def promo_price_apply(cb: CallbackQuery, state: FSMContext, db: Database,
-                            ui: Messenger) -> None:
-    data = await state.get_data()
-    promo_id, price = data.get("promo_id"), data.get("pending")
-    promo = await db.get_promo(promo_id) if promo_id else None
-    await state.clear()
-    if price is None or not promo or promo["archived_at"] is not None:
-        await _promos_screen(ui, db, cb.message.chat.id, cb.message.message_id)
-        await cb.answer(STALE_BUTTON)
-        return
-    await _apply_promo_price(cb, db, ui, promo, price, cb.message.chat.id,
-                             cb.message.message_id)
-    await cb.answer("Цена обновлена")
 
 
 @router.callback_query(F.data.startswith("pr:del:"))
@@ -1675,7 +1574,6 @@ async def promo_delete_ask(cb: CallbackQuery, state: FSMContext, db: Database,
         return
     await _window(cb, ui,
                   join(h("<b>Удаление акции · {}</b>", promo["name"]),
-                       h("Цена: {}", fmt_money(promo["price"])),
                        "Кнопка акции исчезнет у администраторов. Уже "
                        "оформленные заказы сохранятся во всех расчётах"),
                   kb.confirm_kb(f"pr:delok:{promo['id']}", f"pr:open:{promo['id']}"))
@@ -1694,7 +1592,7 @@ async def promo_delete_confirm(cb: CallbackQuery, db: Database,
         done = await db.archive_promo(tx, promo["id"])
         if done:
             await db.audit(tx, _actor(cb), "promo.archive", "promo", promo["id"],
-                           before={"name": promo["name"], "price": promo["price"]},
+                           before={"name": promo["name"]},
                            after={"archived": True})
     if not done:
         await cb.answer("Акция уже удалена", show_alert=True)
@@ -1756,14 +1654,18 @@ async def _discount_screen(cb: CallbackQuery, db: Database, ui: Messenger) -> No
                   kb.discount_kb(settings))
 
 
-async def _pc_bonus_screen(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
+async def _free15_screen(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
     settings = await db.get_settings()
+    note = ("" if settings["free15_enabled"]
+            else "Сейчас выключено — администраторам этот тип не показывается")
     await _window(cb, ui,
-                  join("<b>ПК-бонус</b>",
-                       "На сеансах от 30 минут бот напоминает администратору "
-                       "начислить клиенту баллы на ПК. На цену это не влияет; "
-                       "на заказах по акции напоминания нет"),
-                  kb.pc_bonus_kb(settings))
+                  join(h("<b>{}</b>", FREE15_LABEL),
+                       "Отдельный тип заказа: администратор выбирает его "
+                       "первым шагом, шлемы, длительность и акция не "
+                       "спрашиваются. Цена — 0 ₽, вознаграждение "
+                       "администратора — 0 ₽, места в серии заказ не занимает",
+                       note),
+                  kb.free15_kb(settings))
 
 
 @router.callback_query(F.data == "st:disc")
@@ -1774,11 +1676,11 @@ async def settings_discount(cb: CallbackQuery, state: FSMContext, db: Database,
     await cb.answer()
 
 
-@router.callback_query(F.data == "st:pc")
-async def settings_pc_bonus(cb: CallbackQuery, state: FSMContext, db: Database,
-                            ui: Messenger) -> None:
+@router.callback_query(F.data == "st:free")
+async def settings_free15(cb: CallbackQuery, state: FSMContext, db: Database,
+                          ui: Messenger) -> None:
     await state.clear()
-    await _pc_bonus_screen(cb, db, ui)
+    await _free15_screen(cb, db, ui)
     await cb.answer()
 
 
@@ -1836,10 +1738,10 @@ async def setting_toggle(cb: CallbackQuery, db: Database, ui: Messenger) -> None
         await db.set_setting(tx, key, value)
         await db.audit(tx, _actor(cb), "setting.change", "setting", None,
                        before={key: settings[key]}, after={key: value})
-    if key == "discount_enabled":
+    if TOGGLE_SCREENS[key] == "st:disc":
         await _discount_screen(cb, db, ui)
     else:
-        await _pc_bonus_screen(cb, db, ui)
+        await _free15_screen(cb, db, ui)
     await cb.answer("Настройка обновлена")
 
 
@@ -1859,9 +1761,6 @@ async def setting_ask(cb: CallbackQuery, state: FSMContext, db: Database,
     elif key == "discount_percent":
         current = fmt_percent(settings[key])
         prompt = "Введите размер скидки в процентах — больше 0 и меньше 100"
-    elif key == "pc_bonus_points":
-        current = str(int(settings[key]))
-        prompt = "Введите число баллов"
     else:
         current = fmt_money(settings[key])
         prompt = "Введите цену в рублях"
@@ -1925,16 +1824,6 @@ async def setting_set(message: Message, state: FSMContext, db: Database,
                  "Введите значение ещё раз"),
             kb.cancel_kb(SETTING_SCREENS.get(key, "st:prices")))
         return
-    if key == "pc_bonus_points":
-        value = round(value)
-        if value < 1:
-            await ui.window(
-                message.chat.id,
-                join(h("<b>{}</b>", SETTING_TITLES[key]),
-                     "Баллы — целое число не меньше 1",
-                     "Введите значение ещё раз"),
-                kb.cancel_kb(SETTING_SCREENS.get(key, "st:prices")))
-            return
     settings = await db.get_settings()
     old_value = settings[key]
     if key.startswith("price_") and old_value > 0 and (
@@ -1964,9 +1853,6 @@ async def _apply_setting(event, db: Database, ui: Messenger, key: str,
     if key.startswith("price_"):
         await ui.window(chat_id, join("<b>Цены сеансов</b>", "Цена обновлена"),
                         kb.prices_kb(settings))
-    elif key == "pc_bonus_points":
-        await ui.window(chat_id, join("<b>ПК-бонус</b>", "Значение обновлено"),
-                        kb.pc_bonus_kb(settings))
     else:
         await ui.window(chat_id, join("<b>Скидка</b>", "Значение обновлено"),
                         kb.discount_kb(settings))

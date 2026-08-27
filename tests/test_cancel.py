@@ -153,6 +153,27 @@ async def test_vrheaven_cancel_notifies_everyone_but_the_actor(
     assert bot.records(other)
 
 
+async def test_vrheaven_cancel_of_a_free_session_promises_nothing_back(
+        db, ui, config, bot, worker):
+    """У бесплатного сеанса вознаграждения не было — «снято 0 ₽» было бы
+    обещанием денег, которых никто не начислял."""
+    owner, admin = await _club(db)
+    order_id = await make_order(db, admin, owner, kind="free15", price=0,
+                                headsets=None, minutes=None, admin_share=0,
+                                series_pos=None)
+    await order_cancel_confirm(
+        fake_cb(f"ac:ok:{order_id}", chat_id=VR_CHAT, message_id=WINDOW),
+        db, ui, config)
+    await drain(worker)
+
+    assert (await db.get_order(order_id))["cancelled_at"] is not None
+    assert await db.admin_unpaid_bonuses(admin["id"]) == []
+    admin_texts = bot.records(ADMIN_CHAT)
+    assert admin_texts and "снято" not in admin_texts[0]
+    assert "15 минут бесплатно" in "".join(
+        bot.records(next(iter(VR_ADMIN_IDS - {VR_CHAT}))))
+
+
 async def test_vrheaven_cancel_is_idempotent(db, ui, config, bot, worker):
     owner, admin = await _club(db)
     order_id = await make_order(db, admin, owner, price=300)
