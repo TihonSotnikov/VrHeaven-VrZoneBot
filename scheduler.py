@@ -58,10 +58,14 @@ PAYOUT_DAY_NOTE = ("Выплата проводится вручную; итог
 
 async def _send_period_reports(db: Database, tx, rows, build_report,
                                stamp: str) -> None:
-    """Отчёт накопленного каждому получателю с ненулевой долей.
+    """Отчёт текущего периода каждому получателю с ненулевой долей.
 
-    Нулевое накопление отчёта не получает — обещание «к выплате» было бы
-    ложным. У администратора накопление due_sum включает бонусы.
+    Нулевой итог отчёта не получает — обещание «к выплате» было бы
+    ложным. У администратора итог due_sum включает бонусы.
+
+    Отчёт закрывается одной припиской: сегодняшняя (выплата идёт вручную,
+    итог ещё может измениться) заменяет обычную про календарь — иначе
+    внизу стояли бы две фразы об одном и том же.
     """
     for row in rows:
         if row["due_sum"] <= 0:
@@ -70,7 +74,6 @@ async def _send_period_reports(db: Database, tx, rows, build_report,
             continue
         user = await db.get_user(row["id"])
         report = await build_report(user)
-        report.add(PAYOUT_DAY_NOTE)
         await notify.to_user(db, tx, user, report.to_html(rich=False),
                              kind="period_report",
                              dedup=f"payout_day:{stamp}:{row['id']}")
@@ -80,13 +83,14 @@ async def payout_day_job(db: Database, ui: Messenger, config: Config) -> None:
     """1-го и 15-го в 10:00: сводка VR Heaven и отчёты получателям.
 
     Период закрывается выплатой, а не календарём (SPEC §4), поэтому
-    заголовок говорит «накоплено к выплате», а не «период закрыт»:
+    заголовок говорит «к выплате на <дату>», а не «период закрыт»:
     обещать закрытие, которого не происходит, — прямой путь к спору
-    о числах, которые не сойдутся.
+    о числах, которые не сойдутся. Приписка снизу добавляет, что выплату
+    проводят руками и итог ещё может измениться.
     """
     today = datetime.now(config.tz)
     stamp = today.strftime("%Y-%m-%d")
-    title = f"Накоплено к выплате на {today.strftime('%d.%m.%Y')}"
+    title = f"К выплате на {today.strftime('%d.%m.%Y')}"
     summary = await reports.vrheaven_summary(db)
     summary.title = f"День выплат · {today.strftime('%d.%m.%Y')}"
     summary.add(PAYOUT_DAY_NOTE)
@@ -96,12 +100,14 @@ async def payout_day_job(db: Database, ui: Messenger, config: Config) -> None:
                                      dedup=f"payout_day:{stamp}:vr")
         await _send_period_reports(
             db, tx, await db.owners_unpaid_summary(),
-            lambda user: reports.owner_period(db, user, config.tz, title=title),
+            lambda user: reports.owner_period(db, user, config.tz, title=title,
+                                              note=PAYOUT_DAY_NOTE),
             stamp)
         await _send_period_reports(
             db, tx, await db.admins_unpaid_summary(),
             lambda user: reports.admin_period(db, user, config.tz, title=title,
-                                              with_today=False),
+                                              with_series=False,
+                                              note=PAYOUT_DAY_NOTE),
             stamp)
     ui.wake()
 
@@ -133,6 +139,18 @@ async def backup_job(db: Database, ui: Messenger, config: Config) -> None:
         return
     offhost_error = await bk.push_offhost(config, info)
     async with db.write() as tx:
+        if info.problems:
+            # Копия снята и годна к восстановлению, но деньги в ней не
+            # сходятся. Раньше такое расхождение отменяло саму копию и
+            # тем самым прятало себя же; теперь оно приходит человеком
+            # читаемой тревогой, а копия остаётся на месте
+            await notify.to_super_admins(
+                db, tx, config,
+                join("<b>Деловые инварианты не сходятся</b>",
+                     h("Копия: {}", info.name),
+                     h("{}", "\n".join(info.problems[:5])),
+                     "Копия снята и сохранена — расхождение разбирается по ней"),
+                kind="alert", dedup=f"invariants:{info.name}")
         await db.audit(tx, Actor.system(), "backup.create", "setting", None,
                        after={"name": info.name, "size": info.size,
                               "offhost": "ok" if config.backup_offhost_cmd
@@ -175,7 +193,7 @@ async def restore_check_job(db: Database, ui: Messenger, config: Config) -> None
         await _alert(db, ui, config,
                      join("<b>Резервная копия не прошла проверку</b>",
                           h("Файл: {}", newest.name),
-                          "\n".join(problems[:5])),
+                          h("{}", "\n".join(problems[:5]))),
                      dedup=f"restore_bad:{newest.name}")
         return
     async with db.write() as tx:

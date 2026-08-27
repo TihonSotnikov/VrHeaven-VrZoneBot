@@ -15,6 +15,8 @@
 
 import sqlite3
 import sys
+from bisect import bisect_left, insort
+from dataclasses import dataclass
 
 from pricing import SALARY_LADDER, ladder_amount
 
@@ -34,20 +36,55 @@ def _not_whole_cents(value) -> bool:
     return abs(scaled - round(scaled)) > CENT_EPSILON
 
 
-def check_database(path: str) -> list[str]:
-    """Возвращает список нарушений; пустой список — всё сходится."""
+@dataclass(frozen=True)
+class Report:
+    """Итог проверки, разделённый по последствиям.
+
+    Разделение не косметическое. Непригодный файл нельзя опубликовать
+    копией, нельзя развернуть и нельзя мигрировать: дальше с ним будет
+    только хуже. Расхождение в деньгах — повод разобраться человеку, но
+    не повод остановить копии, выкладку и запуск бота: данные от этого
+    целее не станут, а единственный канал, которым о расхождении можно
+    узнать, закроется вместе с копиями.
+    """
+
+    integrity: tuple[str, ...] = ()
+    business: tuple[str, ...] = ()
+
+    @property
+    def problems(self) -> list[str]:
+        return [*self.integrity, *self.business]
+
+
+def inspect_database(path: str) -> Report:
+    """Проверяет файл базы и раскладывает найденное по последствиям."""
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        problems: list[str] = []
-        problems += _check_sqlite(conn)
-        problems += _check_order_shares(conn)
-        problems += _check_payouts(conn)
-        problems += _check_uniqueness(conn)
-        problems += _check_series(conn)
-        return problems
+        business: list[str] = []
+        business += _check_order_shares(conn)
+        business += _check_payouts(conn)
+        business += _check_uniqueness(conn)
+        business += _check_series(conn)
+        return Report(integrity=tuple(_check_sqlite(conn)), business=tuple(business))
     finally:
         conn.close()
+
+
+def check_database(path: str) -> list[str]:
+    """Возвращает список нарушений; пустой список — всё сходится."""
+    return inspect_database(path).problems
+
+
+def _tables(conn) -> set[str]:
+    """Какие таблицы в файле есть.
+
+    База прежней версии не знает ни бонусов, ни акций: они появляются
+    миграцией v1. Судить о них по такому файлу нечем, а снимок с него
+    снять обязательно — это единственная точка отката той самой миграции.
+    """
+    return {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
 def _check_sqlite(conn) -> list[str]:
@@ -102,10 +139,12 @@ def _check_order_shares(conn) -> list[str]:
 def _check_payouts(conn) -> list[str]:
     """Сумма выплаты обязана сходиться с тем, что она закрыла."""
     problems = []
-    for row in conn.execute("SELECT id, amount FROM bonuses"):
-        if _not_whole_cents(row["amount"]):
-            problems.append(
-                f"бонус №{row['id']}: сумма {row['amount']} не кратна копейке")
+    has_bonuses = "bonuses" in _tables(conn)
+    if has_bonuses:
+        for row in conn.execute("SELECT id, amount FROM bonuses"):
+            if _not_whole_cents(row["amount"]):
+                problems.append(
+                    f"бонус №{row['id']}: сумма {row['amount']} не кратна копейке")
     for row in conn.execute("SELECT id, amount FROM payouts"):
         if _not_whole_cents(row["amount"]):
             problems.append(
@@ -119,10 +158,13 @@ def _check_payouts(conn) -> list[str]:
             f" FROM orders WHERE {payout_col} = ?",
             (payout["id"],),
         ).fetchone()
-        bonuses = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) AS total FROM bonuses WHERE payout_id = ?",
+        closed_bonuses = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n"
+            " FROM bonuses WHERE payout_id = ?",
             (payout["id"],),
-        ).fetchone()["total"]
+        ).fetchone() if has_bonuses else None
+        bonuses = closed_bonuses["total"] if closed_bonuses else 0
+        bonus_count = closed_bonuses["n"] if closed_bonuses else 0
         expected = round(row["total"] + bonuses, 2)
         if _cents(expected) != _cents(payout["amount"]):
             problems.append(
@@ -134,7 +176,10 @@ def _check_payouts(conn) -> list[str]:
                 f"выплата №{payout['id']}: заказов записано {payout['orders_count']},"
                 f" фактически {row['n']}"
             )
-        if payout["amount"] == 0 and row["n"] == 0 and bonuses == 0:
+        # Пустая — та, что не закрыла ни одной строки. Судить по сумме
+        # бонусов нельзя: бонус и равное ему удержание дают ноль, а строки
+        # настоящие, и период ими закрывается законно (SPEC §4)
+        if payout["amount"] == 0 and row["n"] == 0 and bonus_count == 0:
             problems.append(f"выплата №{payout['id']}: пустая")
     return problems
 
@@ -146,13 +191,15 @@ def _check_uniqueness(conn) -> list[str]:
         " WHERE is_active = 1 AND deleted_at IS NULL GROUP BY handle HAVING n > 1"
     ):
         problems.append(f"логин «{row['handle']}» у {row['n']} действующих записей")
-    columns = {r[1] for r in conn.execute("PRAGMA table_info(promos)")}
-    name_col = "name_folded" if "name_folded" in columns else "name"
-    for row in conn.execute(
-        f"SELECT {name_col} AS name, COUNT(*) AS n FROM promos"
-        f" WHERE archived_at IS NULL GROUP BY {name_col} HAVING n > 1"
-    ):
-        problems.append(f"акция «{row['name']}» существует в {row['n']} экземплярах")
+    if "promos" in _tables(conn):
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(promos)")}
+        name_col = "name_folded" if "name_folded" in columns else "name"
+        for row in conn.execute(
+            f"SELECT {name_col} AS name, COUNT(*) AS n FROM promos"
+            f" WHERE archived_at IS NULL GROUP BY {name_col} HAVING n > 1"
+        ):
+            problems.append(
+                f"акция «{row['name']}» существует в {row['n']} экземплярах")
     order_columns = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
     if "client_token" in order_columns:
         for row in conn.execute(
@@ -164,54 +211,105 @@ def _check_uniqueness(conn) -> list[str]:
 
 
 def _check_series(conn) -> list[str]:
-    """В одной 12-часовой серии администратора не бывает двух заказов
-    с одинаковым местом — иначе кто-то недополучил вознаграждение.
+    """Место в серии обязано сходиться с числом заказов до него.
 
-    Серия берётся из самого заказа (`series_since`), а не выводится из
-    текущего расписания сбросов: настройка меняется, прошлое — нет.
+    Место считается при оформлении: неотменённые заказы серии плюс один.
+    Отмена освобождает ступень (SPEC §3), поэтому после отмены заказа из
+    середины серии следующий заказ законно получает место, которое уже
+    занято живым заказом. Прежнее правило «двух заказов на одном месте не
+    бывает» объявляло это нарушением — и одна законная отмена навсегда
+    останавливала снятие копий базы.
+
+    Серия заказа — окно от его собственной границы (`series_since`), а не
+    выведенное из текущего расписания сбросов: настройка меняется,
+    прошлое — нет. «Заказы до него» считаются по этому окну ровно так,
+    как считал их `create_order`, а не складыванием заказов с одинаковой
+    границей: VR Heaven может сдвинуть время сбросов посреди серии
+    (SPEC §3), и тогда у соседних заказов границы разные, хотя считались
+    они друг за другом. Счёт по совпадению границ объявлял бы такую пару
+    нарушением при каждой проверке — навсегда.
+
+    Проверяется то, что от отмен не зависит. Пусть в окне заказа перед
+    ним стоит k−1 заказов, из которых l не отменены сейчас. Отмена
+    необратима, значит на момент оформления неотменённых было не меньше l
+    и не больше k−1, а место обязано лежать в [l+1, k]. Выход за границы
+    означает, что ступень выдана мимо правила: гонка двух устройств,
+    ручная правка, порча файла.
+
     Заказы прежних версий границы не несут, восстановить её нечем, и
     сравнивать их не с чем — они проверяются только по лесенке.
     """
     problems = []
     columns = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
     if "series_since" in columns:
-        seen: dict[tuple, int] = {}
+        # моменты оформления заказов администратора, отсортированные:
+        # все и, отдельно, неотменённые сейчас
+        placed: dict[int, list[str]] = {}
+        live: dict[int, list[str]] = {}
+        holder: dict[tuple, int] = {}          # чей живой заказ занял место
         for row in conn.execute(
-            "SELECT id, admin_id, series_pos, series_since FROM orders"
-            " WHERE cancelled_at IS NULL AND series_pos IS NOT NULL"
-            " AND series_since IS NOT NULL ORDER BY id"
+            "SELECT id, admin_id, series_pos, series_since, created_at, cancelled_at"
+            " FROM orders WHERE series_pos IS NOT NULL AND series_since IS NOT NULL"
+            " ORDER BY id"
         ):
-            key = (row["admin_id"], row["series_since"], row["series_pos"])
-            if key in seen:
+            admin, since = row["admin_id"], row["series_since"]
+            before = placed.setdefault(admin, [])
+            alive = live.setdefault(admin, [])
+            pos = row["series_pos"]
+            highest = len(before) - bisect_left(before, since) + 1
+            lowest = len(alive) - bisect_left(alive, since) + 1
+            if not lowest <= pos <= highest:
+                twin = holder.get((admin, since, pos))
                 problems.append(
-                    f"заказы №{seen[key]} и №{row['id']}: одно место"
-                    f" {row['series_pos']} в одной серии"
+                    f"заказы №{twin} и №{row['id']}: одно место {pos} в одной серии"
+                    if twin is not None else
+                    f"заказ №{row['id']}: место {pos} в серии не сходится"
+                    f" с числом заказов до него ({lowest}…{highest})"
                 )
-            else:
-                seen[key] = row["id"]
+            # моменты — UTC ISO одного вида, поэтому сравниваются строками
+            created = row["created_at"] or ""
+            insort(before, created)
+            if row["cancelled_at"] is None:
+                insort(alive, created)
+                holder.setdefault((admin, since, pos), row["id"])
     if SALARY_LADDER != (50.0, 100.0, 150.0, 200.0, 250.0):
         problems.append("лесенка вознаграждения отличается от описанной в SPEC")
     return problems
 
 
+# Коды возврата: развёртывание и откат читают именно их, поэтому разница
+# между «файл непригоден» и «деньги не сходятся» выражена кодом, а не
+# только текстом. Непригодный файл разворачивать нельзя; расхождение в
+# деньгах — тревога человеку, а не причина остановить выкладку.
+EXIT_OK = 0
+EXIT_BROKEN_FILE = 1
+EXIT_USAGE = 2
+EXIT_BUSINESS = 3
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("Использование: python invariants.py <файл базы>")
-        return 2
+        return EXIT_USAGE
     if len(sys.argv) > 2:
         # Прежние версии принимали часовой пояс вторым аргументом; он
         # больше ни на что не влияет, но и ронять проверку из-за него
         # посреди разбора происшествия незачем
         print("Часовой пояс больше не нужен: проверки от него не зависят",
               file=sys.stderr)
-    problems = check_database(sys.argv[1])
-    if not problems:
+    report = inspect_database(sys.argv[1])
+    if not report.problems:
         print("Инварианты выполнены: расхождений нет")
-        return 0
-    print(f"Найдено расхождений: {len(problems)}")
-    for problem in problems:
-        print(" -", problem)
-    return 1
+        return EXIT_OK
+    if report.integrity:
+        print(f"Файл базы непригоден: {len(report.integrity)}")
+        for problem in report.integrity:
+            print(" -", problem)
+    if report.business:
+        print(f"Деловые расхождения: {len(report.business)}")
+        for problem in report.business:
+            print(" -", problem)
+    return EXIT_BROKEN_FILE if report.integrity else EXIT_BUSINESS
 
 
 if __name__ == "__main__":

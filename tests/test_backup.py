@@ -10,6 +10,7 @@ import pytest
 from helpers import create_admin, create_owner, make_order
 
 import backup as bk
+from invariants import Report
 
 
 def _names(config) -> list[str]:
@@ -50,13 +51,27 @@ async def test_backup_contains_the_data(db, config):
 
 
 async def test_broken_snapshot_is_not_published(db, config, monkeypatch):
-    """Копия, не прошедшая проверку, не появляется в каталоге вовсе."""
+    """Копия непригодного файла не появляется в каталоге вовсе."""
     await _seed(db)
-    monkeypatch.setattr(bk, "_verify_file", lambda path: ["сломано"])
+    monkeypatch.setattr(bk, "_verify_file",
+                        lambda path: Report(integrity=("сломано",)))
     with pytest.raises(RuntimeError, match="не прошла проверку"):
         await bk.create_backup(config, bk.REASON_DAILY)
     assert bk.list_backups(config.backup_dir) == []
     assert [n for n in _names(config) if n.startswith(".tmp")] == []
+
+
+async def test_business_discrepancy_does_not_cancel_the_backup(db, config,
+                                                               monkeypatch):
+    """Расхождение в деньгах копию не отменяет: она и нужна, чтобы
+    разобраться. Раньше одна такая строка навсегда останавливала копии."""
+    await _seed(db)
+    monkeypatch.setattr(bk, "_verify_file",
+                        lambda path: Report(business=("доли не сходятся",)))
+    info = await bk.create_backup(config, bk.REASON_DAILY)
+    assert os.path.exists(info.path)
+    assert info.problems == ("доли не сходятся",), (
+        "расхождение обязано доехать до человека вместе с копией")
 
 
 async def test_failed_backup_never_destroys_an_existing_one(db, config, monkeypatch):
@@ -133,5 +148,34 @@ async def test_invariant_failures_are_visible_in_verification(db, config):
     conn.execute("UPDATE orders SET owner_share = owner_share + 1")
     conn.commit()
     conn.close()
-    problems = bk._verify_file(raw)
-    assert problems and "доля владельца" in problems[0]
+    report = bk._verify_file(raw)
+    assert report.business and "доля владельца" in report.business[0]
+    assert not report.integrity, "файл цел — испорчены только деньги в нём"
+
+
+async def test_a_pre_migration_snapshot_of_the_old_schema_is_taken(tmp_path):
+    """Снимок перед миграцией — единственная точка её отката, и снимать
+    его приходится с базы, в которой миграции ещё не было. Бонусов и
+    акций там нет: требовать их значило бы не дать мигрировать вовсе."""
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+    create table users(id integer primary key, role text, handle text,
+      is_active integer, deleted_at text);
+    create table orders(id integer primary key, price real, admin_share real,
+      owner_share real, owner_percent real, series_pos integer, owner_id integer);
+    create table payouts(id integer primary key, user_id integer, amount real,
+      orders_count integer);
+    insert into orders values(1, 300, 50, 0, 0, 1, null);
+    """)
+    conn.commit()
+    conn.close()
+    report = bk._verify_file(path)
+    assert not report.integrity and not report.business
+
+
+def test_missing_table_is_a_file_problem_not_a_money_problem(tmp_path):
+    """Копия без таблиц не восстановит ничего — это свойство файла."""
+    path = str(tmp_path / "empty.db")
+    sqlite3.connect(path).close()
+    assert bk._verify_file(path).integrity

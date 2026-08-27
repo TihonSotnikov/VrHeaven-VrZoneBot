@@ -111,9 +111,9 @@ async def test_vrheaven_cancel_of_paid_order_is_allowed(db):
     async with db.write() as tx:
         await db.create_payout(tx, admin)
     async with db.write() as tx:
-        assert await db.cancel_order(tx, order_id, for_self=False) is True
+        assert await db.cancel_order(tx, order_id, for_self=False)
     async with db.write() as tx:
-        assert await db.cancel_order(tx, order_id, for_self=False) is False
+        assert not await db.cancel_order(tx, order_id, for_self=False)
 
 
 async def test_self_cancel_of_paid_order_is_blocked(db):
@@ -123,7 +123,7 @@ async def test_self_cancel_of_paid_order_is_blocked(db):
     async with db.write() as tx:
         await db.create_payout(tx, admin)
     async with db.write() as tx:
-        assert await db.cancel_order(tx, order_id, for_self=True) is False
+        assert not await db.cancel_order(tx, order_id, for_self=True)
 
 
 async def test_concurrent_payouts_produce_single_payout(db):

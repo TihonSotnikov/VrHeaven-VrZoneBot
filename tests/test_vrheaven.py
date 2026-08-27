@@ -242,17 +242,40 @@ async def test_user_log_screen_shows_recent_actions(db, ui, config):
 
 # ------------------------------------------------------------------ Выплата
 
-async def test_zero_accumulation_is_not_offered_for_payout(db, ui):
+async def test_empty_period_is_not_offered_for_payout(db, ui):
+    """Строк нет — платить нечего: ни кнопки, ни экрана подтверждения."""
     await _panel(db)
-    owner = await create_owner(db, percent=0)
+    owner = await create_owner(db)
     admin = await create_admin(db, owner)
     await make_order(db, admin, owner, price=300)
+    async with db.write() as tx:
+        await db.create_payout(tx, owner)             # период владельца закрыт
     await payout_list(_cb("po:list"), make_state(db, VR_CHAT), db, ui)
     buttons = " ".join(await button_texts(db, VR_CHAT))
     assert "владелец" not in buttons and "администратор" in buttons
     cb = _cb(f"po:p:{owner['id']}")
     await payout_pick(cb, db, ui)
-    assert cb.answer.await_args.kwargs.get("show_alert") is True
+    text = await window_text(db, VR_CHAT)
+    assert "уже нет долей к выплате" in text
+    assert "Подтвердить" not in await button_texts(db, VR_CHAT)
+
+
+async def test_a_period_of_zero_share_orders_can_be_closed(db, ui):
+    """Доля нулевая, но строки настоящие: период обязан закрываться,
+    иначе заказы висят открытыми вечно и вечно числятся в остатке
+    VR Heaven (SPEC §4). Отчёт дня выплат такому получателю по-прежнему
+    не уходит — там граница по ненулевой доле."""
+    await _panel(db)
+    owner = await create_owner(db, percent=0)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=300)
+    total = await db.owner_unpaid_total(owner["id"])
+    assert total["due_sum"] == 0 and db.is_payable(total)
+    await payout_list(_cb("po:list"), make_state(db, VR_CHAT), db, ui)
+    assert "владелец" in " ".join(await button_texts(db, VR_CHAT))
+
+    await payout_confirm(_cb(f"po:ok:{owner['id']}"), db, ui)
+    assert (await db.owner_unpaid_total(owner["id"]))["orders_count"] == 0
 
 
 async def test_payout_notifies_the_recipient_and_closes_the_period(

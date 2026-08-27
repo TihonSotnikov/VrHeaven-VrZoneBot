@@ -10,6 +10,12 @@ from markup import h, join
 
 SUPPORT = "@VrHeaven"
 
+# Обращение в поддержку звучало в боте пятью разными фразами — «Служба
+# поддержки», «обращайтесь в VR Heaven», «по всем вопросам». Форм ровно
+# две: строка-контакт внизу сообщения и прямое указание, что делать
+SUPPORT_LINE = f"Поддержка: {SUPPORT}"
+SUPPORT_ASK = f"Обратитесь в поддержку: {SUPPORT}"
+
 SUPPORT_TEXT = join(
     "<b>Поддержка</b>",
     f"Вопросы по заказам, доступу и выплатам — {SUPPORT}",
@@ -22,8 +28,10 @@ GROUP_TEXT = (
     f"пароли и суммы. Откройте бота лично и нажмите /start · {SUPPORT}"
 )
 
+# Кнопка во всех трёх меню называется одинаково (SPEC §9), поэтому и
+# подпись к файлу одна: разные слова об одном и том же действии
 GUIDE_TITLES = {
-    "superadmin": ("Как работает бот", "vrheaven-instrukciya.md"),
+    "superadmin": ("Как пользоваться ботом", "vrheaven-instrukciya.md"),
     "owner": ("Как пользоваться ботом", "vladelec-instrukciya.md"),
     "admin": ("Как пользоваться ботом", "administrator-instrukciya.md"),
 }

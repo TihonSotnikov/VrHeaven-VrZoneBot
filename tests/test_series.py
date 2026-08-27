@@ -143,7 +143,7 @@ async def test_statistics_show_the_series_and_the_next_step(db, ui, config, monk
     _freeze(monkeypatch, datetime(2026, 8, 12, 12, 0, tzinfo=tz))
     html = (await reports.admin_period(db, admin, tz)).to_html(rich=False)
     assert "Серия с 09:00: заказов 1" in html
-    assert "следующий заказ — 100 ₽" in html
+    assert "следующий — 100 ₽" in html
 
 
 # ------------------- Граница серии живёт в заказе, а не в настройке
@@ -183,6 +183,93 @@ async def test_changing_reset_time_does_not_reinterpret_past_orders(db):
         await db.set_user_series_reset(tx, admin["id"], 7 * 60)
     assert check_database(db.path) == [], (
         "настройка изменилась — прошлые заказы обязаны остаться как были")
+
+
+async def test_a_reset_moved_mid_series_is_not_a_violation(db, ui, config, monkeypatch):
+    """Сброс сдвинут посреди серии: у соседних заказов границы разные, а
+    считались они друг за другом.
+
+    Проверка, складывающая заказы по совпадению границ, объявляла такую
+    пару нарушением — и тревога о расхождении приходила с каждой копией
+    базы, вечно, хотя ступень выдана ровно по правилу.
+    """
+    from invariants import check_database
+
+    admin = await _admin(db)
+    tz = config.tz
+    async with db.write() as tx:
+        await db.set_user_series_reset(tx, admin["id"], 6 * 60)
+    # заказ серии со сбросом в 06:00, оформленный в 10:00
+    await make_order(
+        db, admin, price=300, series_pos=1,
+        created_at=datetime(2026, 8, 12, 10, 0, tzinfo=tz)
+        .astimezone(UTC).isoformat(timespec="seconds"),
+        series_since=datetime(2026, 8, 12, 6, 0, tzinfo=tz)
+        .astimezone(UTC).isoformat(timespec="seconds"))
+    # VR Heaven переносит сбросы на 09:00: граница новой серии — 09:00,
+    # и заказ 10:00 попадает в неё же
+    async with db.write() as tx:
+        await db.set_user_series_reset(tx, admin["id"], 9 * 60)
+    _freeze(monkeypatch, datetime(2026, 8, 12, 11, 0, tzinfo=tz))
+    await _place(db, ui, config, make_state(db, ADMIN_CHAT))
+
+    first, second = await db.get_order(1), await db.get_order(2)
+    assert second["series_pos"] == 2, "заказ продолжает живую серию"
+    assert first["series_since"] != second["series_since"]
+    assert check_database(db.path) == []
+
+
+async def test_cancelling_a_middle_order_is_not_a_violation(db):
+    """Отмена освобождает ступень (SPEC §3): следующий заказ законно
+    получает место живого заказа. Раньше проверка объявляла это порчей —
+    и одна законная отмена навсегда останавливала снятие копий базы."""
+    from invariants import check_database
+
+    admin = await create_admin(db, handle="adm1")
+    boundary = "2026-08-20T02:00:00+00:00"
+    first = await make_order(db, admin, price=300, series_pos=1,
+                             created_at="2026-08-20T08:00:00+00:00",
+                             series_since=boundary)
+    await make_order(db, admin, price=300, series_pos=2,
+                     created_at="2026-08-20T08:10:00+00:00", series_since=boundary)
+    async with db.write() as tx:
+        await db.cancel_order(tx, first, for_self=False)
+    # неотменённых в серии осталось 1 — следующий заказ идёт вторым,
+    # ровно как живой заказ №2
+    await make_order(db, admin, price=300, series_pos=2,
+                     created_at="2026-08-20T08:20:00+00:00", series_since=boundary)
+    assert check_database(db.path) == []
+
+
+async def test_the_whole_series_may_be_cancelled_and_started_over(db):
+    """Отменены все заказы серии — счёт начинается заново с первой ступени."""
+    from invariants import check_database
+
+    admin = await create_admin(db, handle="adm1")
+    boundary = "2026-08-20T02:00:00+00:00"
+    for pos in (1, 2, 3):
+        order_id = await make_order(
+            db, admin, price=300, series_pos=pos, series_since=boundary,
+            created_at=f"2026-08-20T08:0{pos}:00+00:00")
+        async with db.write() as tx:
+            await db.cancel_order(tx, order_id, for_self=False)
+    await make_order(db, admin, price=300, series_pos=1, series_since=boundary,
+                     created_at="2026-08-20T08:30:00+00:00")
+    assert check_database(db.path) == []
+
+
+async def test_a_step_above_the_series_length_is_reported(db):
+    """Ступень выше, чем заказов в серии, отменой не объясняется:
+    отмена место освобождает, а не выдаёт новое."""
+    from invariants import check_database
+
+    admin = await create_admin(db, handle="adm1")
+    boundary = "2026-08-20T02:00:00+00:00"
+    await make_order(db, admin, price=300, series_pos=1,
+                     created_at="2026-08-20T08:00:00+00:00", series_since=boundary)
+    await make_order(db, admin, price=300, series_pos=3,
+                     created_at="2026-08-20T08:10:00+00:00", series_since=boundary)
+    assert any("не сходится" in p for p in check_database(db.path))
 
 
 async def test_two_orders_of_one_series_still_cannot_share_a_step(db):

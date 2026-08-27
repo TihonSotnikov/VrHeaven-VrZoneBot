@@ -70,7 +70,7 @@ def vrheaven_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="Настройки", callback_data="st:menu")
     kb.button(text="Экспорт данных", callback_data="ex")
     kb.button(text="Доступ VR Heaven", callback_data="sa:menu")
-    kb.button(text="Как работает", callback_data="guide")
+    kb.button(text="Как пользоваться", callback_data="guide")
     kb.button(text="Отменить заказ", callback_data="ac:list")
     kb.adjust(1)
     return kb.as_markup()
@@ -148,9 +148,10 @@ def user_card_kb(user, prefix: str, bonus_count: int = 0) -> InlineKeyboardMarku
     администратору доступны бонусы и время сбросов серии."""
     kb = InlineKeyboardBuilder()
     if user["role"] == "admin":
-        kb.button(text="Начислить бонус", callback_data=f"ad:bonus:{user['id']}")
+        kb.button(text="Записать бонус или удержание",
+                  callback_data=f"ad:bonus:{user['id']}")
         if bonus_count:
-            kb.button(text=f"Бонусы к выплате ({bonus_count})",
+            kb.button(text=f"Бонусы и удержания ({bonus_count})",
                       callback_data=f"ad:blist:{user['id']}")
         kb.button(text="Сменить владельца", callback_data=f"ad:own:{user['id']}")
         kb.button(text="Сбросы серии", callback_data=f"ad:reset:{user['id']}")
@@ -433,12 +434,16 @@ def order_done_kb(order_id: int, *, cancellable: bool) -> InlineKeyboardMarkup:
 
 
 def staff_orders_pick_kb(orders, tz) -> InlineKeyboardMarkup:
-    """Заказы администратора, доступные к отмене (в пределах 15 минут)."""
+    """Заказы администратора, доступные к отмене (в пределах 15 минут).
+
+    Номер, состав и время опознают заказ; цена в подписи была бы лишней
+    цифрой на экране, где выбирают, а не считают деньги.
+    """
     kb = InlineKeyboardBuilder()
     for o in orders:
         kb.button(
-            text=f"№{o['id']} {order_row_label(o)}"
-                 f" · {fmt_money(o['price'])} · {fmt_dt(o['created_at'], tz, '%H:%M')}",
+            text=f"№{o['id']} · {order_row_label(o)}"
+                 f" · {fmt_dt(o['created_at'], tz, '%H:%M')}",
             callback_data=f"sc:o:{o['id']}",
         )
     kb.button(text="В меню", callback_data="sm")

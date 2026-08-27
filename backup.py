@@ -7,7 +7,9 @@
 2. Копия пишется во временный файл и только затем переименовывается на
    место: неудачная копия не может уничтожить удачную.
 3. Копия проверяется сразу после создания (целостность файла, связи
-   таблиц, деловые инварианты). Непрошедшая проверку копия не публикуется.
+   таблиц, деловые инварианты). Непригодный файл не публикуется вовсе;
+   расхождение в деньгах копию не отменяет, а едет с ней тревогой —
+   иначе одна спорная строка в базе оставляла бы систему без копий.
 4. Перед каждой миграцией снимается отдельная копия, которая не участвует
    в ротации 90 дней.
 5. Восстановимость проверяется расписанием: копия открывается, по ней
@@ -31,7 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from config import Config
-from invariants import check_database
+from invariants import Report, inspect_database
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +60,10 @@ class BackupInfo:
     created: datetime
     reason: str
     size: int
+    # Деловые расхождения, найденные в самой копии. Публикации они не
+    # мешают (см. _create_sync), но обязаны дойти до человека: их
+    # разбирает тот, кому уходит копия
+    problems: tuple[str, ...] = ()
 
 
 def parse_name(name: str) -> tuple[datetime, str] | None:
@@ -92,21 +98,43 @@ def _snapshot(db_path: str, target: str) -> None:
         conn.close()
 
 
-def _verify_file(path: str) -> list[str]:
-    problems = check_database(path)
+def _verify_file(path: str) -> Report:
+    """Проверка копии: пригодность файла отдельно от денежных расхождений.
+
+    Отсутствие таблицы — свойство файла, а не денег: такая копия не
+    восстановит ничего. Проверяется первой: по копии без таблиц не о чем
+    судить, и деловые проверки на ней только упали бы с ошибкой SQL
+    вместо внятного «в копии нет таблицы».
+
+    Обязательны только три опоры учёта. Бонусы и акции появляются
+    миграцией v1, и требовать их означало бы отказаться снимать снимок
+    базы прежней версии — то есть отказаться от единственной точки
+    отката ровно той миграции, которая эти таблицы и создаёт.
+    """
+    missing = []
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for required in ("users", "orders", "payouts"):
             if required not in tables:
-                problems.append(f"в копии нет таблицы {required}")
+                missing.append(f"в копии нет таблицы {required}")
     finally:
         conn.close()
-    return problems
+    if missing:
+        return Report(integrity=tuple(missing))
+    return inspect_database(path)
 
 
 def _create_sync(db_path: str, backup_dir: str, reason: str) -> BackupInfo:
+    """Снимок, проверка, публикация переименованием.
+
+    Копию отменяет только непригодный файл. Расхождение в деньгах копию
+    не портит — оно в ней уже есть, и копия как раз и нужна, чтобы
+    разобраться; отказ снимать её оставил бы систему без единственного
+    способа вернуться к тому, что было. Расхождения едут дальше в
+    BackupInfo и уходят тревогой.
+    """
     os.makedirs(backup_dir, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     final = os.path.join(backup_dir, f"{PREFIX}{stamp}-{reason}{SUFFIX}")
@@ -114,9 +142,10 @@ def _create_sync(db_path: str, backup_dir: str, reason: str) -> BackupInfo:
     raw, packed = work + ".db", work + SUFFIX
     try:
         _snapshot(db_path, raw)
-        problems = _verify_file(raw)
-        if problems:
-            raise RuntimeError("копия не прошла проверку: " + "; ".join(problems[:5]))
+        report = _verify_file(raw)
+        if report.integrity:
+            raise RuntimeError("копия не прошла проверку: "
+                               + "; ".join(report.integrity[:5]))
         with open(raw, "rb") as src, gzip.open(packed, "wb", compresslevel=6) as dst:
             shutil.copyfileobj(src, dst)
         # Переименование атомарно: файл на месте появляется целиком
@@ -127,7 +156,7 @@ def _create_sync(db_path: str, backup_dir: str, reason: str) -> BackupInfo:
                 os.remove(path)
     return BackupInfo(name=os.path.basename(final), path=final,
                       created=datetime.now(UTC), reason=reason,
-                      size=os.path.getsize(final))
+                      size=os.path.getsize(final), problems=report.business)
 
 
 async def create_backup(config: Config, reason: str, *,
@@ -137,6 +166,9 @@ async def create_backup(config: Config, reason: str, *,
         _create_sync, db_path or config.db_path, config.backup_dir, reason,
     )
     log.info("Резервная копия: %s (%.1f КБ)", info.name, info.size / 1024)
+    if info.problems:
+        log.error("Копия %s снята, но деловые инварианты не сходятся: %s",
+                  info.name, "; ".join(info.problems[:5]))
     await asyncio.to_thread(rotate, config)
     return info
 
@@ -190,7 +222,7 @@ def _verify_backup_sync(path: str) -> tuple[list[str], dict]:
         restored = os.path.join(tmp, "restored.db")
         with gzip.open(path, "rb") as src, open(restored, "wb") as dst:
             shutil.copyfileobj(src, dst)
-        problems = _verify_file(restored)
+        problems = _verify_file(restored).problems
         conn = sqlite3.connect(f"file:{restored}?mode=ro", uri=True)
         try:
             stats = {

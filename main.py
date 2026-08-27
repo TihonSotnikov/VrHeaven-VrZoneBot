@@ -71,6 +71,15 @@ class SingleInstance:
             self._handle = None
 
 
+def _log_discrepancies(info: bk.BackupInfo) -> None:
+    """Деловые расхождения копию не отменяют, но и незамеченными не
+    остаются: в журнале они есть с первой секунды, тревогой супер-админам
+    уходят с ближайшей суточной копией."""
+    if info.problems:
+        log.error("Копия %s снята, но деловые инварианты не сходятся:\n%s",
+                  info.name, "\n".join(f" - {p}" for p in info.problems[:5]))
+
+
 async def boot_backup(config: Config) -> None:
     """Копия перед открытием базы: снимок того состояния, к которому
     можно вернуться, если обновление окажется неудачным."""
@@ -79,6 +88,7 @@ async def boot_backup(config: Config) -> None:
     try:
         info = await bk.create_backup(config, bk.REASON_BOOT)
         log.info("Копия перед запуском: %s", info.name)
+        _log_discrepancies(info)
     except Exception:
         # Бэкап не должен мешать боту стартовать, но молчать о нём нельзя
         log.exception("Не удалось снять копию базы перед запуском")
@@ -99,8 +109,12 @@ async def run() -> None:
         log.warning("Ожидают применения миграции: %s",
                     ", ".join(f"v{m.version} {m.name}" for m in pending))
         if os.path.exists(config.db_path):
+            # Снимок — единственная точка отката схемы, поэтому неудача
+            # здесь миграцию отменяет. Отменяет её непригодный файл, а не
+            # спор о деньгах: тот уезжает в журнал и миграции не мешает
             info = await bk.create_backup(config, bk.REASON_PRE_MIGRATION)
             log.warning("Копия перед миграцией: %s", info.name)
+            _log_discrepancies(info)
 
     await db.init(before_migration=before_migration)
     log.info("Схема базы: версия %s", await db.schema_version())

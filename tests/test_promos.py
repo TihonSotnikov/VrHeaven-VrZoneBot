@@ -12,12 +12,14 @@ from helpers import (
     window_text,
 )
 
+from errors import STALE_BUTTON
 from handlers.vrheaven import (
     promo_add_name,
     promo_add_price,
     promo_add_start,
     promo_delete_confirm,
     promo_open,
+    promo_price_apply,
     promo_price_ask,
     promo_price_set,
     promos_menu,
@@ -34,6 +36,11 @@ async def _add(db, ui, name="День рождения", price="700"):
     await promo_add_name(fake_msg(name, chat_id=VR_CHAT), state, db, ui)
     await promo_add_price(fake_msg(price, chat_id=VR_CHAT), state, db, ui)
     return state
+
+
+async def _ask_price(db, ui, promo, state):
+    await promo_price_ask(fake_cb(f"pr:price:{promo['id']}", chat_id=VR_CHAT,
+                                  message_id=WINDOW), state, db, ui)
 
 
 async def test_promo_is_created_and_listed(db, ui):
@@ -101,6 +108,56 @@ async def test_promo_price_can_be_edited_without_changing_its_id(db, ui):
     await promo_price_set(fake_msg("750", chat_id=VR_CHAT), state, db, ui)
     updated = await db.get_promo(promo["id"])
     assert updated["id"] == promo["id"] and updated["price"] == 750.0
+
+
+async def test_tripled_promo_price_requires_confirmation(db, ui):
+    """Та же защита, что у цен сеансов: цену акции платит клиент
+    у прилавка, и лишний ноль не должен переписать её молча."""
+    await set_window(db, VR_CHAT, WINDOW)
+    await _add(db, ui, "3=4", "600")
+    promo = (await db.list_promos())[0]
+    state = make_state(db, VR_CHAT)
+    await _ask_price(db, ui, promo, state)
+    await promo_price_set(fake_msg("6000", chat_id=VR_CHAT), state, db, ui)
+    assert (await db.get_promo(promo["id"]))["price"] == 600.0
+    text = await window_text(db, VR_CHAT)
+    assert "Было: 600 ₽" in text and "Станет: 6\u00a0000 ₽" in text
+
+    await promo_price_apply(fake_cb("pr:priceok", chat_id=VR_CHAT,
+                                    message_id=WINDOW), state, db, ui)
+    assert (await db.get_promo(promo["id"]))["price"] == 6000.0
+    log = await db.export_audit()
+    assert log[-1]["action"] == "promo.price"
+
+
+async def test_cancelling_the_tripled_promo_price_leaves_it_alone(db, ui):
+    await set_window(db, VR_CHAT, WINDOW)
+    await _add(db, ui, "3=4", "600")
+    promo = (await db.list_promos())[0]
+    state = make_state(db, VR_CHAT)
+    await _ask_price(db, ui, promo, state)
+    await promo_price_set(fake_msg("60", chat_id=VR_CHAT), state, db, ui)
+    assert "Подтвердите изменение" in await window_text(db, VR_CHAT)
+    # Отмена ведёт на карточку акции и закрывает сценарий
+    await promo_open(fake_cb(f"pr:open:{promo['id']}", chat_id=VR_CHAT,
+                             message_id=WINDOW), state, db, ui)
+    assert (await db.get_promo(promo["id"]))["price"] == 600.0
+    assert await state.get_state() is None
+
+
+async def test_confirming_a_price_for_a_deleted_promo_is_safe(db, ui):
+    await set_window(db, VR_CHAT, WINDOW)
+    await _add(db, ui, "3=4", "600")
+    promo = (await db.list_promos())[0]
+    state = make_state(db, VR_CHAT)
+    await _ask_price(db, ui, promo, state)
+    await promo_price_set(fake_msg("6000", chat_id=VR_CHAT), state, db, ui)
+    await promo_delete_confirm(fake_cb(f"pr:delok:{promo['id']}", chat_id=VR_CHAT,
+                                       message_id=WINDOW), db, ui)
+    cb = fake_cb("pr:priceok", chat_id=VR_CHAT, message_id=WINDOW)
+    await promo_price_apply(cb, state, db, ui)
+    assert (await db.get_promo(promo["id"]))["price"] == 600.0
+    assert cb.answer.await_args.args[0] == STALE_BUTTON
 
 
 async def test_delete_archives_and_keeps_order_history(db, ui):

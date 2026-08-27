@@ -23,7 +23,7 @@ import reports
 from config import Config
 from db import Actor, Database
 from errors import STALE_BUTTON, cb_int, cb_ints, cb_tail
-from handlers.common import SUPPORT, guide_bytes, guide_caption
+from handlers.common import SUPPORT_LINE, guide_bytes, guide_caption
 from markup import (
     COMMENT_MAX,
     CONTACT_MAX,
@@ -32,6 +32,7 @@ from markup import (
     PROMO_NAME_MAX,
     h,
     join,
+    lines,
 )
 from messaging import Messenger, document_payload
 from pricing import WEEKDAY_NAMES, fmt_days, normalize_reset, order_row_label, toggle_day
@@ -258,25 +259,48 @@ async def order_find(message: Message, state: FSMContext, db: Database,
                     if order["cancelled_at"] is None else kb.to_vrheaven_menu_kb())
 
 
+def _paid_warning(order) -> str:
+    """Что по заказу уже выплачено и что с этим станет при отмене.
+
+    Проведённые выплаты не пересчитываются (SPEC §5), но заканчивается это
+    для сторон по-разному: выплаченное вознаграждение возвращается
+    удержанием, выплаченная доля владельца остаётся у владельца. Названы
+    обе половины — молчание об одной читалось бы как обещание вернуть обе.
+    Сумм здесь нет: они стоят строкой выше, и повторять их незачем.
+    """
+    if order["admin_payout_id"] is None and order["owner_payout_id"] is None:
+        return ""
+    said = ["Внимание: доля по заказу уже входила в проведённую выплату"]
+    if order["admin_payout_id"] is not None and order["admin_share"]:
+        said.append("Вознаграждение вернётся удержанием из ближайшей "
+                    "выплаты администратору")
+    if order["owner_payout_id"] is not None and order["owner_share"]:
+        said.append("Выплаченная доля владельца не пересчитывается")
+    return lines(*said)
+
+
 def _order_card_text(order, config: Config) -> str:
-    warn = ""
-    if order["admin_payout_id"] is not None or order["owner_payout_id"] is not None:
-        warn = "Внимание: доля по заказу уже включена в проведённую выплату"
+    """Карточка заказа перед отменой: факты, последствие, действие.
+
+    Предупреждение о выплаченной доле стоит между фактами и строкой о
+    том, что произойдёт: это условие решения, а не примечание под ним.
+    """
+    warn = _paid_warning(order)
     if order["cancelled_at"] is not None:
         warn = h("Заказ уже отменён {}",
                  fmt_dt(order["cancelled_at"], config.tz))
     return join(
         h("<b>Заказ №{}</b>", order["id"]),
-        h("Администратор: {}\nВладелец: {}\nЗаказ: {}\nСумма: {}\nДата: {}",
+        h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}\nДата: {}\n"
+          "Вознаграждение: {} · доля владельца: {} · остаток: {}",
           order["admin_handle"], order["owner_handle"] or "—",
           order_row_label(order), fmt_money(order["price"]),
-          fmt_dt(order["created_at"], config.tz)),
-        h("Вознаграждение: {} · доля владельца: {} · остаток: {}",
+          fmt_dt(order["created_at"], config.tz),
           fmt_money(order["admin_share"]), fmt_money(order["owner_share"]),
           fmt_money(round(order["price"] - order["admin_share"]
                           - order["owner_share"], 2))),
-        "Заказ будет исключён из расчёта долей" if order["cancelled_at"] is None else "",
         warn,
+        "Заказ будет исключён из расчёта долей" if order["cancelled_at"] is None else "",
     )
 
 
@@ -304,26 +328,43 @@ async def order_cancel_confirm(cb: CallbackQuery, db: Database, ui: Messenger,
     if not order:
         await cb.answer("Заказ не найден", show_alert=True)
         return
-    cancelled_by = h("Заказ отменил VR Heaven\nСлужба поддержки: {}", SUPPORT)
+    cancelled_by = h("Заказ отменил VR Heaven\n{}", SUPPORT_LINE)
     date = fmt_dt(order["created_at"], config.tz, "%d.%m.%Y")
     notes: list[str] = []
+    debt_line = ""
     async with db.write() as tx:
         done = await db.cancel_order(tx, order_id, for_self=False)
         if done:
+            # Долг называется вслух везде, где говорят об отмене: молчание
+            # о нём — то же самое исчезновение денег из учёта, только на
+            # экране вместо базы
+            if done.debt:
+                debt_line = h(
+                    "Вознаграждение {} за этот заказ уже было выплачено — оно "
+                    "записано удержанием №{} и вычтется из ближайшей выплаты",
+                    fmt_money(done.debt), done.bonus_id)
             await db.audit(tx, _actor(cb), "order.cancel", "order", order_id,
                            before={"cancelled": False},
                            after={"cancelled": True, "by": "vrheaven",
-                                  "price": order["price"]})
+                                  "price": order["price"], "debt": done.debt,
+                                  "bonus": done.bonus_id})
             admin = await db.get_user(order["admin_id"])
             if admin and admin["deleted_at"] is None:
                 total = await db.admin_unpaid_total(admin["id"])
+                # Снять можно только то, что ещё не выплачено: про уже
+                # выплаченное вознаграждение говорит debt_line, и второй
+                # строки о той же сумме быть не должно
+                removed = "" if done.debt else h(
+                    "\nВознаграждение {} снято", fmt_money(order["admin_share"]))
                 count = await notify.to_user(
                     db, tx, admin,
                     join("<b>Заказ отменён</b>",
-                         h("Ваш заказ №{} от {} на сумму {} исключён из расчёта "
-                           "долей\nНакоплено к выплате: {}",
-                           order_id, date, fmt_money(order["price"]),
-                           fmt_money(total["due_sum"])),
+                         h("Ваш заказ №{} от {} исключён из расчёта долей",
+                           order_id, date)
+                         + removed
+                         + h("\nК выплате: {}",
+                             fmt_money(total["due_sum"])),
+                         debt_line,
                          cancelled_by),
                     kind="order_cancelled", dedup=f"cancel:{order_id}:admin")
                 notes.append(notify.devices_note(count, "Администратор"))
@@ -331,22 +372,33 @@ async def order_cancel_confirm(cb: CallbackQuery, db: Database, ui: Messenger,
                 owner = await db.get_user(order["owner_id"])
                 if owner and owner["deleted_at"] is None:
                     total = await db.owner_unpaid_total(owner["id"])
+                    if not order["owner_share"]:
+                        removed = ""      # доли по этому заказу не было вовсе
+                    elif order["owner_payout_id"] is not None:
+                        # Снять уже выплаченное нельзя, и владелец обязан
+                        # услышать это словами, а не догадываться по цифре
+                        removed = "\nВыплаченная доля не пересчитывается"
+                    else:
+                        removed = h("\nВаша доля {} снята",
+                                    fmt_money(order["owner_share"]))
                     count = await notify.to_user(
                         db, tx, owner,
                         join("<b>Заказ отменён</b>",
-                             h("Заказ №{} от {} на сумму {} исключён из расчёта "
-                               "долей\nНакоплено к выплате: {}",
-                               order_id, date, fmt_money(order["price"]),
-                               fmt_money(total["share_sum"])),
+                             h("Заказ №{} от {} исключён из расчёта долей",
+                               order_id, date)
+                             + removed
+                             + h("\nК выплате: {}",
+                                 fmt_money(total["share_sum"])),
                              cancelled_by),
                         kind="order_cancelled", dedup=f"cancel:{order_id}:owner")
                     notes.append(notify.devices_note(count, "Владелец"))
             await notify.to_super_admins(
                 db, tx, config,
                 join(h("<b>Заказ №{} отменён</b>", order_id),
-                     h("Администратор: {}\nВладелец: {}\nЗаказ: {}\nСумма: {}",
+                     h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}",
                        order["admin_handle"], order["owner_handle"] or "—",
                        order_row_label(order), fmt_money(order["price"])),
+                     debt_line,
                      cancelled_by),
                 kind="order_cancelled", dedup=f"cancel:{order_id}:vr",
                 exclude_tg_id=cb.from_user.id)
@@ -361,6 +413,7 @@ async def order_cancel_confirm(cb: CallbackQuery, db: Database, ui: Messenger,
         cb, ui,
         join(h("<b>Заказ №{} отменён</b>", order_id),
              h("Сумма {} исключена из расчёта долей", fmt_money(order["price"])),
+             debt_line,
              "\n".join(n for n in notes if n)),
         kb.to_vrheaven_menu_kb())
     await cb.answer("Заказ отменён")
@@ -390,17 +443,20 @@ async def _user_card_text(db: Database, user) -> str:
         head += h("\nДоля: {}", fmt_percent(user["percent"]))
     head += h("\nСтатус: {}\nКабинет: {}", status, cabinet)
     if user["role"] == "admin":
+        # Бонусы уже сидят в due_sum, поэтому они — уточнение к итогу,
+        # а не слагаемое после числа заказов, как читалось прежде
         bonus_line = ""
         if total["bonus_sum"]:
-            bonus_line = h(" + бонусы {}", fmt_signed_money(total["bonus_sum"]))
-        head += h("\nК выплате: {} · заказов: {}", fmt_money(total["due_sum"]),
-                  total["orders_count"]) + bonus_line
+            bonus_line = h(" · в том числе бонусы {}",
+                           fmt_signed_money(total["bonus_sum"]))
+        head += h("\nЗаказов в периоде: {}", total["orders_count"])
+        head += h("\nК выплате: {}", fmt_money(total["due_sum"])) + bonus_line
     else:
         admins = await db.admins_of_owner(user["id"])
         names = ", ".join(a["handle"] for a in admins) if admins else "нет"
         head += h("\nАдминистраторы: {}", names)
-        head += h("\nК выплате: {} · заказов: {}", fmt_money(total["share_sum"]),
-                  total["orders_count"])
+        head += h("\nЗаказов в периоде: {}\nК выплате: {}",
+                  total["orders_count"], fmt_money(total["share_sum"]))
     return head
 
 
@@ -654,6 +710,20 @@ async def user_pct_set(message: Message, state: FSMContext, db: Database,
 
 # ------------------------------------------------- Бонусы администраторам
 
+def _bonus_terms(amount: float) -> dict[str, str]:
+    """Слова для бонуса и для удержания — экраны у них общие, а род разный.
+
+    Отрицательная сумма — удержание (SPEC §3а), и называть его бонусом
+    на экране, где сумма уже видна со знаком, значит спорить с
+    собственным числом.
+    """
+    if amount > 0:
+        return {"noun": "Бонус", "genitive": "бонуса", "created": "начислен",
+                "cancelled": "отменён", "excluded": "исключён"}
+    return {"noun": "Удержание", "genitive": "удержания", "created": "записано",
+            "cancelled": "отменено", "excluded": "исключено"}
+
+
 async def _get_managed_admin(cb: CallbackQuery, db: Database):
     """Действующий (не удалённый) администратор из callback-данных."""
     user_id = cb_int(cb.data)
@@ -674,10 +744,10 @@ async def bonus_ask_amount(cb: CallbackQuery, state: FSMContext, db: Database,
     await state.update_data(admin_id=user["id"], handle=user["handle"])
     await _window(
         cb, ui,
-        join(h("<b>Бонус · {}</b>", user["handle"]),
+        join(h("<b>Бонус или удержание · {}</b>", user["handle"]),
              "Введите сумму в рублях — например 500.\n"
              "Отрицательная сумма — удержание, например −300",
-             "Бонус войдёт в ближайшую выплату администратора"),
+             "Сумма учтётся в ближайшей выплате администратора"),
         kb.cancel_kb(f"ad:card:{user['id']}"))
     await cb.answer()
 
@@ -693,17 +763,19 @@ async def bonus_amount_step(message: Message, state: FSMContext, db: Database,
     if amount is None:
         await ui.window(
             message.chat.id,
-            join(h("<b>Бонус · {}</b>", data["handle"]),
+            join(h("<b>Бонус или удержание · {}</b>", data["handle"]),
                  "Сумма — число, не ноль: 500 или −300",
                  "Введите сумму ещё раз"),
             kb.cancel_kb(f"ad:card:{data['admin_id']}"))
         return
     await state.update_data(amount=amount)
     await state.set_state(AddBonusSG.comment)
+    terms = _bonus_terms(amount)
     await ui.window(
         message.chat.id,
-        join(h("<b>Бонус · {} · {}</b>", data["handle"], fmt_signed_money(amount)),
-             h("Введите комментарий — за что бонус (до {} символов).\n"
+        join(h("<b>{} · {} · {}</b>", terms["noun"], data["handle"],
+               fmt_signed_money(amount)),
+             h("Введите комментарий — за что (до {} символов).\n"
                "Комментарий обязателен: администратор увидит его в "
                "уведомлении и в своей статистике", COMMENT_MAX)),
         kb.cancel_kb(f"ad:card:{data['admin_id']}"))
@@ -717,10 +789,11 @@ async def bonus_comment_step(message: Message, state: FSMContext, db: Database,
     if "amount" not in data:
         return
     comment = " ".join(message.text.split())
+    terms = _bonus_terms(data["amount"])
     if not comment or len(comment) > COMMENT_MAX:
         await ui.window(
             message.chat.id,
-            join(h("<b>Бонус · {} · {}</b>", data["handle"],
+            join(h("<b>{} · {} · {}</b>", terms["noun"], data["handle"],
                    fmt_signed_money(data["amount"])),
                  h("Комментарий обязателен и не длиннее {} символов",
                    COMMENT_MAX),
@@ -731,12 +804,16 @@ async def bonus_comment_step(message: Message, state: FSMContext, db: Database,
     if not user or user["deleted_at"] is not None:
         await state.clear()
         await ui.window(message.chat.id,
-                        join(h("<b>Бонус · {}</b>", data["handle"]),
-                             "Администратор не найден — бонус не начислен"),
+                        join(h("<b>{} · {}</b>", terms["noun"], data["handle"]),
+                             h("Администратор не найден — {} не {}",
+                               terms["noun"].lower(), terms["created"])),
                         kb.admins_menu_kb())
         return
     await state.clear()
-    kind_word = "Вам начислен бонус" if data["amount"] > 0 else "Удержание из выплаты"
+    positive = data["amount"] > 0
+    kind_word = "Вам начислен бонус" if positive else "Удержание из выплаты"
+    effect = ("Войдёт в ближайшую выплату" if positive
+              else "Вычтется из ближайшей выплаты")
     async with db.write() as tx:
         bonus_id = await db.create_bonus(tx, user["id"], data["amount"], comment)
         await db.audit(tx, _actor(message), "bonus.create", "bonus", bonus_id,
@@ -746,14 +823,15 @@ async def bonus_comment_step(message: Message, state: FSMContext, db: Database,
             db, tx, user,
             join(f"<b>{kind_word}</b>",
                  h("Сумма: {}\nЗа что: {}", fmt_signed_money(data["amount"]), comment),
-                 "Сумма войдёт в ближайшую выплату"),
+                 effect),
             kind="bonus", dedup=f"bonus:{bonus_id}")
     ui.wake()
     await _render_user_card(
         ui, db, message.chat.id, user, "ad",
-        head=join(h("<b>Бонус №{} начислен</b>", bonus_id),
-                  h("Сумма: {}\nЗа что: {}\n{}", fmt_signed_money(data["amount"]),
-                    comment, notify.devices_note(devices, "Администратор"))),
+        head=join(h("<b>{} №{} {}</b>", terms["noun"], bonus_id, terms["created"]),
+                  h("Сумма: {}\nЗа что: {}", fmt_signed_money(data["amount"]),
+                    comment),
+                  notify.devices_note(devices, "Администратор")),
     )
 
 
@@ -768,16 +846,16 @@ async def bonus_list(cb: CallbackQuery, state: FSMContext, db: Database,
     if not bonuses:
         await _render_user_card(ui, db, cb.message.chat.id, user, "ad",
                                 source_message_id=cb.message.message_id)
-        await cb.answer("Невыплаченных бонусов нет")
+        await cb.answer("Невыплаченных бонусов и удержаний нет")
         return
     body = "\n".join(
         h("№{} · {} · {} · {}", b["id"], fmt_signed_money(b["amount"]),
           fmt_dt(b["created_at"], config.tz, "%d.%m.%Y"), b["comment"] or "—")
         for b in bonuses)
     await _window(cb, ui,
-                  join(h("<b>Бонусы к выплате · {}</b>", user["handle"]), body,
-                       "Нажмите бонус, чтобы отменить его. "
-                       "Выплаченные бонусы не корректируются"),
+                  join(h("<b>Бонусы и удержания · {}</b>", user["handle"]), body,
+                       "Нажмите строку, чтобы отменить её. "
+                       "Выплаченные суммы не корректируются"),
                   kb.bonuses_kb(bonuses, user["id"]))
     await cb.answer()
 
@@ -788,15 +866,17 @@ async def bonus_cancel_ask(cb: CallbackQuery, db: Database, ui: Messenger,
     bonus_id = cb_int(cb.data)
     bonus = await db.get_bonus(bonus_id) if bonus_id else None
     if not bonus or bonus["cancelled_at"] is not None or bonus["payout_id"] is not None:
-        await cb.answer("Бонус уже выплачен или отменён", show_alert=True)
+        await cb.answer("Уже выплачено или отменено", show_alert=True)
         return
+    terms = _bonus_terms(bonus["amount"])
     await _window(
         cb, ui,
-        join(h("<b>Отмена бонуса №{}</b>", bonus["id"]),
-             h("Администратор: {}\nСумма: {}\nЗа что: {}\nНачислен: {}",
+        join(h("<b>Отмена {} №{}</b>", terms["genitive"], bonus["id"]),
+             h("Администратор: {}\nСумма: {}\nЗа что: {}\nЗаписано: {}",
                bonus["admin_handle"], fmt_signed_money(bonus["amount"]),
                bonus["comment"] or "—", fmt_dt(bonus["created_at"], config.tz)),
-             "Бонус будет исключён из расчёта выплат"),
+             h("{} будет {} из расчёта выплат", terms["noun"],
+               terms["excluded"])),
         kb.confirm_kb(f"ad:bdelok:{bonus['id']}", f"ad:blist:{bonus['admin_id']}"))
     await cb.answer()
 
@@ -807,9 +887,10 @@ async def bonus_cancel_confirm(cb: CallbackQuery, db: Database,
     bonus_id = cb_int(cb.data)
     bonus = await db.get_bonus(bonus_id) if bonus_id else None
     if not bonus:
-        await cb.answer("Бонус не найден", show_alert=True)
+        await cb.answer("Запись не найдена", show_alert=True)
         return
     user = await db.get_user(bonus["admin_id"])
+    terms = _bonus_terms(bonus["amount"])
     devices = 0
     async with db.write() as tx:
         done = await db.cancel_bonus(tx, bonus["id"])
@@ -820,27 +901,28 @@ async def bonus_cancel_confirm(cb: CallbackQuery, db: Database,
             if user and user["deleted_at"] is None:
                 devices = await notify.to_user(
                     db, tx, user,
-                    join("<b>Бонус отменён</b>",
-                         h("Бонус {} ({}) исключён из расчёта выплат",
-                           fmt_signed_money(bonus["amount"]), bonus["comment"] or "—"),
-                         h("По всем вопросам обращайтесь в поддержку: {}", SUPPORT)),
+                    join(h("<b>{} {}</b>", terms["noun"], terms["cancelled"]),
+                         h("{} {} ({}) {} из расчёта выплат", terms["noun"],
+                           fmt_signed_money(bonus["amount"]),
+                           bonus["comment"] or "—", terms["excluded"]),
+                         SUPPORT_LINE),
                     kind="bonus", dedup=f"bonus:{bonus['id']}:cancel")
     ui.wake()
     if not done:
-        await cb.answer("Бонус уже выплачен или отменён", show_alert=True)
+        await cb.answer("Уже выплачено или отменено", show_alert=True)
         return
+    head = h("<b>{} №{} {}</b>", terms["noun"], bonus["id"], terms["cancelled"])
     if user:
         await _render_user_card(
             ui, db, cb.message.chat.id, user, "ad",
-            head=join(h("<b>Бонус №{} отменён</b>", bonus["id"]),
-                      h("Сумма {} исключена из расчёта выплат\n{}",
-                        fmt_signed_money(bonus["amount"]),
-                        notify.devices_note(devices, "Администратор"))),
+            head=join(head,
+                      h("Сумма {} исключена из расчёта выплат",
+                        fmt_signed_money(bonus["amount"])),
+                      notify.devices_note(devices, "Администратор")),
             source_message_id=cb.message.message_id)
     else:
-        await _window(cb, ui, h("<b>Бонус №{} отменён</b>", bonus["id"]),
-                      kb.admins_menu_kb())
-    await cb.answer("Бонус отменён")
+        await _window(cb, ui, head, kb.admins_menu_kb())
+    await cb.answer(h("{} {}", terms["noun"], terms["cancelled"]))
 
 
 # ------------------------------------------------- Время сбросов серии
@@ -934,9 +1016,12 @@ async def user_delete_ask(cb: CallbackQuery, db: Database, ui: Messenger) -> Non
             return
     total = await db.unpaid_total(user)
     warn = ""
-    if total["due_sum"] > 0 or total["orders_count"] > 0:
-        warn = h("Внимание: к выплате числится {} — после удаления сумма "
-                 "не будет выплачена", fmt_money(total["due_sum"]))
+    if round(total["due_sum"], 2) > 0:
+        # Предупреждаем только о том, что действительно пропадёт.
+        # Отрицательный итог никто и не собирался выплачивать: фраза
+        # «к выплате числится −250 ₽» пугала суммой, которой нет
+        warn = h("Внимание: к выплате числится {} — после удаления эта "
+                 "сумма не будет выплачена", fmt_money(total["due_sum"]))
     await _window(
         cb, ui,
         join(h("<b>Удаление · {}</b>", user["handle"]),
@@ -1258,12 +1343,27 @@ async def summary(cb: CallbackQuery, state: FSMContext, db: Database,
 
 # ------------------------------------------------------------------ Выплата
 
+def _payout_refusal(total) -> str:
+    """Почему выплата не состоялась — по текущему состоянию периода.
+
+    Отрицательный итог — не «долей нет»: доли есть, и получатель обязан
+    знать, что мешает выплате и когда она пройдёт. Одна формулировка на
+    оба отказа — при выборе получателя и при подтверждении.
+    """
+    if round(total["due_sum"], 2) < 0:
+        return h("Итог периода отрицательный: {}. Удержание переносится в "
+                 "следующий период — выплата пройдёт, когда начисленного "
+                 "станет не меньше удержанного",
+                 fmt_signed_money(total["due_sum"]))
+    return "У получателя уже нет долей к выплате"
+
+
 @router.callback_query(F.data == "po:list")
 async def payout_list(cb: CallbackQuery, state: FSMContext, db: Database,
                       ui: Messenger) -> None:
     await state.clear()
-    # Получатели с нулевым накоплением не платятся; у администратора
-    # накопление включает бонусы
+    # Получатель с нулевым итогом периода не платится; у администратора
+    # итог включает бонусы
     entries = []
     for r in await db.owners_unpaid_summary():
         if db.is_payable(r):
@@ -1279,9 +1379,7 @@ async def payout_list(cb: CallbackQuery, state: FSMContext, db: Database,
         await cb.answer()
         return
     await _window(cb, ui,
-                  join("<b>Выплата</b>",
-                       "Выберите получателя. Выплата закрывает его период: "
-                       "доли и бонусы помечаются выплаченными"),
+                  join("<b>Выплата</b>", "Выберите получателя"),
                   kb.payout_pick_kb(entries))
     await cb.answer()
 
@@ -1295,24 +1393,26 @@ async def payout_pick(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
         return
     total = await db.unpaid_total(user)
     if not db.is_payable(total):
-        await cb.answer("У получателя нет долей к выплате", show_alert=True)
+        await _window(cb, ui, join("<b>Выплата</b>", _payout_refusal(total)),
+                      kb.back_kb("po:list", "К списку"))
+        await cb.answer()
         return
     bonus_line = ""
     if total["bonus_sum"]:
-        bonus_line = h("Доля по заказам: {}\nБонусы: {}\n",
+        bonus_line = h("\nДоля по заказам: {}\nБонусы и удержания: {}",
                        fmt_money(total["share_sum"]),
                        fmt_signed_money(total["bonus_sum"]))
     await _window(
         cb, ui,
         join("<b>Подтверждение выплаты</b>",
-             h("Получатель: {} · {} ({})", user["handle"], user["name"],
+             h("Получатель: {} · {} · {}", user["handle"], user["name"],
                kb.ROLE_LABELS[user["role"]])
-             + h("\nЗаказов: {}\nОборот: {}\n", total["orders_count"],
+             + h("\nЗаказов в периоде: {} · оборот {}", total["orders_count"],
                  fmt_money(total["turnover"]))
              + bonus_line
-             + h("<b>К выплате: {}</b>", fmt_money(total["due_sum"])),
-             "После подтверждения доля получателя по заказам периода "
-             "и его бонусы будут помечены выплаченными"),
+             + h("\n<b>К выплате: {}</b>", fmt_money(total["due_sum"])),
+             "Выплата закроет период получателя: доли и бонусы будут "
+             "помечены выплаченными"),
         kb.confirm_kb(f"po:ok:{user['id']}", "po:list"))
     await cb.answer()
 
@@ -1325,6 +1425,7 @@ async def payout_confirm(cb: CallbackQuery, db: Database, ui: Messenger) -> None
         await cb.answer("Получатель не найден", show_alert=True)
         return
     devices = 0
+    result = None
     async with db.write() as tx:
         result = await db.create_payout(tx, user)
         if result is not None:
@@ -1332,29 +1433,35 @@ async def payout_confirm(cb: CallbackQuery, db: Database, ui: Messenger) -> None
             await db.audit(tx, _actor(cb), "payout.create", "payout", payout_id,
                            after={"user": user["handle"], "amount": amount,
                                   "orders": orders_count, "bonuses": bonus_total})
-            bonus_line = (h("Бонусы: {}\n", fmt_signed_money(bonus_total))
-                          if bonus_total else "")
+            bonus_line = (h("\nБонусы и удержания: {}",
+                            fmt_signed_money(bonus_total)) if bonus_total else "")
             devices = await notify.to_user(
                 db, tx, user,
                 join("<b>Выплата проведена</b>",
-                     h("Сумма: {}\nЗаказов в периоде: {}\n",
+                     h("Сумма: {}\nЗаказов закрыто: {}",
                        fmt_money(amount), orders_count) + bonus_line,
-                     "Открыт новый учётный период. Благодарим за сотрудничество"),
+                     "Открыт новый учётный период"),
                 kind="payout", dedup=f"payout:{payout_id}")
     ui.wake()
     if result is None:
-        await _window(cb, ui, join("<b>Выплата</b>",
-                                   "У получателя уже нет долей к выплате"),
+        # Экран подтверждения мог быть собран до удержания, пришедшего
+        # секунду назад: выплата не состоялась, и сказать почему обязан
+        # сегодняшний остаток, а не тот, что был на экране
+        total = await db.unpaid_total(user)
+        await _window(cb, ui, join("<b>Выплата</b>", _payout_refusal(total)),
                       kb.to_vrheaven_menu_kb())
         await cb.answer()
         return
-    bonus_line = h("Бонусы: {}\n", fmt_signed_money(bonus_total)) if bonus_total else ""
+    _, amount, orders_count, bonus_total = result
+    bonus_line = (h("\nБонусы и удержания: {}", fmt_signed_money(bonus_total))
+                  if bonus_total else "")
     await _window(
         cb, ui,
         join("<b>Выплата проведена</b>",
-             h("Получатель: {} · {}\nСумма: {}\nЗаказов закрыто: {}\n",
+             h("Получатель: {} · {}\nСумма: {}\nЗаказов закрыто: {}",
                user["handle"], user["name"], fmt_money(amount), orders_count)
-             + bonus_line + notify.devices_note(devices, "Получатель")),
+             + bonus_line,
+             notify.devices_note(devices, "Получатель")),
         kb.to_vrheaven_menu_kb())
     await cb.answer("Выплата проведена")
 
@@ -1508,15 +1615,51 @@ async def promo_price_set(message: Message, state: FSMContext, db: Database,
                         kb.cancel_kb(f"pr:open:{data['promo_id']}"))
         return
     promo = await db.get_promo(data["promo_id"])
-    await state.clear()
     if not promo or promo["archived_at"] is not None:
+        await state.clear()
         await _promos_screen(ui, db, message.chat.id)
         return
+    if promo["price"] > 0 and (price >= promo["price"] * 3
+                               or price <= promo["price"] / 3):
+        # Тот же запрет, что и у цен сеансов: цену акции платит клиент
+        # у прилавка, и лишний ноль не должен переписать её молча
+        await state.update_data(pending=price)
+        await ui.window(
+            message.chat.id,
+            join(h("<b>Цена акции · {}</b>", promo["name"]),
+                 h("Было: {}\nСтанет: {}", fmt_money(promo["price"]),
+                   fmt_money(price)),
+                 "Цена меняется более чем втрое. Подтвердите изменение"),
+            kb.confirm_kb("pr:priceok", f"pr:open:{promo['id']}"))
+        return
+    await state.clear()
+    await _apply_promo_price(message, db, ui, promo, price, message.chat.id)
+
+
+async def _apply_promo_price(event, db: Database, ui: Messenger, promo,
+                             price: float, chat_id: int,
+                             source_message_id: int | None = None) -> None:
     async with db.write() as tx:
         await db.set_promo_price(tx, promo["id"], price)
-        await db.audit(tx, _actor(message), "promo.price", "promo", promo["id"],
+        await db.audit(tx, _actor(event), "promo.price", "promo", promo["id"],
                        before={"price": promo["price"]}, after={"price": price})
-    await _promos_screen(ui, db, message.chat.id)
+    await _promos_screen(ui, db, chat_id, source_message_id)
+
+
+@router.callback_query(EditPromoPriceSG.value, F.data == "pr:priceok")
+async def promo_price_apply(cb: CallbackQuery, state: FSMContext, db: Database,
+                            ui: Messenger) -> None:
+    data = await state.get_data()
+    promo_id, price = data.get("promo_id"), data.get("pending")
+    promo = await db.get_promo(promo_id) if promo_id else None
+    await state.clear()
+    if price is None or not promo or promo["archived_at"] is not None:
+        await _promos_screen(ui, db, cb.message.chat.id, cb.message.message_id)
+        await cb.answer(STALE_BUTTON)
+        return
+    await _apply_promo_price(cb, db, ui, promo, price, cb.message.chat.id,
+                             cb.message.message_id)
+    await cb.answer("Цена обновлена")
 
 
 @router.callback_query(F.data.startswith("pr:del:"))

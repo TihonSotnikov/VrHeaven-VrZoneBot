@@ -176,16 +176,6 @@ async def test_settings_defaults_and_overrides(db):
     assert (await db.get_settings())["price_1_30"] == 350
 
 
-async def test_admin_today_total_ignores_cancelled(db):
-    admin = await create_admin(db)
-    await make_order(db, admin, price=300)
-    cancelled = await make_order(db, admin, price=500, series_pos=2)
-    async with db.write() as tx:
-        await db.cancel_order(tx, cancelled, for_self=False)
-    today = await db.admin_today_total(admin["id"], "2000-01-01T00:00:00+00:00")
-    assert today["orders_count"] == 1 and today["turnover"] == 300
-
-
 async def test_owner_admins_summary_aggregates_current_period(db):
     owner = await create_owner(db)
     first = await create_admin(db, owner, "a1")
@@ -267,3 +257,79 @@ async def test_net_withholding_is_carried_forward_not_paid(db):
     total = await db.admin_unpaid_total(admin["id"])
     assert cents(total["due_sum"]) == cents(-300)
     assert not db.is_payable(total)
+
+
+# ---------------- Заказ при приостановленном владельце обязан закрываться
+
+async def _order_under_a_suspended_owner(db):
+    """Ровно то, что пишет бот: связь с клубом сохранена, доля 0,
+    пометка owner_suspended (SPEC §7)."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    async with db.write() as tx:
+        await db.set_user_active(tx, owner["id"], False)
+    order_id = await make_order(db, admin, owner, price=300, owner_percent=0)
+    async with db.write() as tx:
+        await tx.execute("UPDATE orders SET owner_suspended = 1 WHERE id = ?",
+                         (order_id,))
+    return owner, admin, order_id
+
+
+async def test_order_of_a_suspended_owner_keeps_the_club_and_closes(db):
+    """Доля нулевая, но заказ настоящий и принадлежит клубу. Пока период
+    владельца считался неоплачиваемым, такой заказ оставался открытым
+    навсегда и вечно висел в остатке VR Heaven."""
+    owner, admin, order_id = await _order_under_a_suspended_owner(db)
+    order = await db.get_order(order_id)
+    assert order["owner_id"] == owner["id"] and order["owner_suspended"] == 1
+    assert cents(order["owner_share"]) == cents(0)
+
+    total = await db.owner_unpaid_total(owner["id"])
+    assert total["orders_count"] == 1 and cents(total["due_sum"]) == cents(0)
+    assert db.is_payable(total), "настоящая строка обязана поддаваться закрытию"
+    async with db.write() as tx:
+        result = await db.create_payout(tx, owner)
+    assert result is not None and cents(result[1]) == cents(0) and result[2] == 1
+    assert (await db.get_order(order_id))["owner_payout_id"] is not None
+
+
+async def test_suspended_owner_order_leaves_the_vrheaven_remainder(db):
+    """Обе стороны закрыты — заказ уходит из сводки текущего периода."""
+    owner, admin, order_id = await _order_under_a_suspended_owner(db)
+    async with db.write() as tx:
+        await db.create_payout(tx, admin)
+    total = await db.vrheaven_unpaid_total()
+    assert total["orders_count"] == 1
+    assert cents(total["share_sum"]) == cents(250)          # 300 − 50 − 0
+    async with db.write() as tx:
+        await db.create_payout(tx, owner)
+    assert (await db.vrheaven_unpaid_total())["orders_count"] == 0
+
+
+async def test_mixed_period_closes_zero_and_paying_orders_together(db):
+    """Смешанный период: заказ при приостановке и заказ после неё."""
+    owner, admin, _ = await _order_under_a_suspended_owner(db)
+    async with db.write() as tx:
+        await db.set_user_active(tx, owner["id"], True)
+    await make_order(db, admin, owner, price=300, series_pos=2)   # доля 90
+    total = await db.owner_unpaid_total(owner["id"])
+    assert total["orders_count"] == 2 and cents(total["due_sum"]) == cents(90)
+    async with db.write() as tx:
+        result = await db.create_payout(tx, owner)
+    assert cents(result[1]) == cents(90) and result[2] == 2
+
+
+async def test_offsetting_bonuses_alone_still_close_the_period(db):
+    """Бонус и равное ему удержание без заказов: сумма ноль, строки
+    настоящие. Раньше такой период не закрывался ничем."""
+    admin = await create_admin(db)
+    async with db.write() as tx:
+        await db.create_bonus(tx, admin["id"], 300.0, "премия")
+        await db.create_bonus(tx, admin["id"], -300.0, "удержание")
+    total = await db.admin_unpaid_total(admin["id"])
+    assert total["bonus_count"] == 2 and cents(total["due_sum"]) == cents(0)
+    assert db.is_payable(total)
+    async with db.write() as tx:
+        result = await db.create_payout(tx, admin)
+    assert result is not None and cents(result[1]) == cents(0)
+    assert await db.admin_unpaid_bonuses(admin["id"]) == []

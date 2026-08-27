@@ -11,7 +11,8 @@
 #
 #   * повторная выкладка действующего тега его не уничтожает;
 #   * неудача после остановки возвращает прежний релиз и поднимает бота;
-#   * копия, не прошедшая инварианты, не стоит простоя;
+#   * непригодный файл копии не стоит простоя, а спор о деньгах в
+#     исправном файле не запирает единственный путь назад;
 #   * при откате WAL прежней базы не остаётся рядом с восстановленной;
 #   * откат, при котором бот не поднялся, возвращает всё как было.
 #
@@ -127,15 +128,20 @@ check "в выводе есть слово о возврате"     "grep -q 'в
 rm -f "$ROOT/start.fails"
 echo running > "$ROOT/service.state"
 
-echo "== 3. Откат с испорченной копией не роняет бота =="
-python3 - "$APP/data/bad.db" <<'PY'
+# Файл базы и деньги в нём — разные беды: непригодный файл откат
+# отменяет (проверка 3), спор о деньгах откату не мешает (проверка 8).
+# Раньше они были неразличимы, и одна отменённая ступень серии
+# запирала единственный путь назад.
+seed_db() {   # seed_db <файл> <строка заказа>
+python3 - "$1" "$2" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 c.executescript("""
 create table users(id integer primary key, role text, handle text, name text,
   contact text, password_hash text, percent real, owner_id integer,
   series_reset_min integer, is_active integer, deleted_at text, created_at text);
-create table orders(id integer primary key, admin_id integer, owner_id integer,
+create table orders(id integer primary key,
+  admin_id integer references users(id), owner_id integer,
   kind text, headsets integer, minutes integer, promo_id integer, promo_name text,
   base_price real, discount_percent real, price real, admin_percent real,
   admin_share real, series_pos integer, series_since text, owner_percent real,
@@ -148,12 +154,16 @@ create table promos(id integer primary key, name text, name_folded text,
 create table bonuses(id integer primary key, admin_id integer, amount real,
   comment text, payout_id integer, cancelled_at text, created_at text);
 insert into users values(1,'admin','a','A','','x',0,null,null,1,null,'2026-01-01T00:00:00+00:00');
--- доля владельца без владельца: настоящая порча
-insert into orders values(1,1,null,'standard',1,30,null,null,300,0,300,0,50,1,
-  '2026-01-01T00:00:00+00:00',0,99,null,null,null,'2026-01-01T00:00:00+00:00');
 """)
+c.execute("insert into orders values(%s)" % sys.argv[2])
 c.commit(); c.close()
 PY
+}
+
+echo "== 3. Откат с непригодным файлом не роняет бота =="
+# заказ ссылается на несуществующего администратора: связи таблиц порваны,
+# такая копия не восстановит ничего
+seed_db "$APP/data/bad.db" "1,42,null,'standard',1,30,null,null,300,0,300,0,50,1,'2026-01-01T00:00:00+00:00',0,0,null,null,null,'2026-01-01T00:00:00+00:00'"
 gzip -c "$APP/data/bad.db" > "$APP/data/backups/bad.db.gz"
 cp "$APP/data/adminbot.db" "$ROOT/db.before"
 bash "$ROOT/rollback.sh" v1.0.0 "$APP/data/backups/bad.db.gz" >"$ROOT/out3" 2>&1; rc=$?
@@ -161,33 +171,10 @@ check "откат отказался (rc=$rc)"           "[ $rc -ne 0 ]"
 check "сервис не остановлен"               "grep -q running '$ROOT/service.state'"
 check "боевая база не тронута"             "cmp -s '$ROOT/db.before' '$APP/data/adminbot.db'"
 check "сказано, что бот работает"          "grep -q 'бот работает' '$ROOT/out3'"
+check "названа причина — сам файл"         "grep -q 'непригоден' '$ROOT/out3'"
 
 echo "== 4. Откат с исправной копией =="
-python3 - "$APP/data/good.db" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.executescript("""
-create table users(id integer primary key, role text, handle text, name text,
-  contact text, password_hash text, percent real, owner_id integer,
-  series_reset_min integer, is_active integer, deleted_at text, created_at text);
-create table orders(id integer primary key, admin_id integer, owner_id integer,
-  kind text, headsets integer, minutes integer, promo_id integer, promo_name text,
-  base_price real, discount_percent real, price real, admin_percent real,
-  admin_share real, series_pos integer, series_since text, owner_percent real,
-  owner_share real, admin_payout_id integer, owner_payout_id integer,
-  cancelled_at text, created_at text);
-create table payouts(id integer primary key, user_id integer, amount real,
-  orders_count integer, created_at text);
-create table promos(id integer primary key, name text, name_folded text,
-  price real, archived_at text, created_at text);
-create table bonuses(id integer primary key, admin_id integer, amount real,
-  comment text, payout_id integer, cancelled_at text, created_at text);
-insert into users values(1,'admin','a','A','','x',0,null,null,1,null,'2026-01-01T00:00:00+00:00');
-insert into orders values(1,1,null,'standard',1,30,null,null,300,0,300,0,50,1,
-  '2026-01-01T00:00:00+00:00',0,0,null,null,null,'2026-01-01T00:00:00+00:00');
-""")
-c.commit(); c.close()
-PY
+seed_db "$APP/data/good.db" "1,1,null,'standard',1,30,null,null,300,0,300,0,50,1,'2026-01-01T00:00:00+00:00',0,0,null,null,null,'2026-01-01T00:00:00+00:00'"
 gzip -c "$APP/data/good.db" > "$APP/data/backups/good.db.gz"
 printf 'stale-wal' > "$APP/data/adminbot.db-wal"
 bash "$ROOT/rollback.sh" v1.0.0 "$APP/data/backups/good.db.gz" >"$ROOT/out4" 2>&1; rc=$?
@@ -221,6 +208,19 @@ UV_FAKE_HOME=/root/.local/share/uv/python/bin \
 check "выкладка отклонена (rc=$rc)"        "[ $rc -ne 0 ]"
 check "сервис не остановлен"               "grep -q running '$ROOT/service.state'"
 check "названа настоящая причина"          "grep -q 'вне /opt' '$ROOT/out7'"
+
+echo "== 8. Спор о деньгах откату не мешает =="
+echo running > "$ROOT/service.state"
+# доля владельца без владельца: файл цел, не сходятся деньги в нём.
+# Копия — единственный путь назад, и отказ ею воспользоваться оставил бы
+# систему на схеме, которую программа не понимает
+seed_db "$APP/data/odd.db" "1,1,null,'standard',1,30,null,null,300,0,300,0,50,1,'2026-01-01T00:00:00+00:00',0,99,null,null,null,'2026-01-01T00:00:00+00:00'"
+gzip -c "$APP/data/odd.db" > "$APP/data/backups/odd.db.gz"
+bash "$ROOT/rollback.sh" v1.0.0 "$APP/data/backups/odd.db.gz" >"$ROOT/out8" 2>&1; rc=$?
+check "откат прошёл (rc=$rc)"              "[ $rc -eq 0 ]"
+check "база заменена копией"               "cmp -s '$APP/data/odd.db' '$APP/data/adminbot.db'"
+check "расхождение названо вслух"          "grep -q 'деньги в копии не сходятся' '$ROOT/out8'"
+check "сервис работает"                    "grep -q running '$ROOT/service.state'"
 
 echo
 echo "итого: успешно $PASS, провалено $FAIL"

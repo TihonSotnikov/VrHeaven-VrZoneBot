@@ -57,6 +57,7 @@ def _all_callbacks() -> set[str]:
         kb.orders_pick_kb(orders, tz, prev_cb="ac:list", next_cb="ac:page:5"),
         kb.welcome_kb(), kb.login_cancel_kb(), kb.cancel_kb(),
         kb.confirm_kb("po:ok:4", "po:list"), kb.back_kb("ad:card:4"),
+        kb.confirm_kb("pr:priceok", "pr:open:3"),
     ]
     return {button.callback_data
             for markup in markups
@@ -68,7 +69,7 @@ def _all_callbacks() -> set[str]:
 # Часть кнопок живёт только на экране своего сценария: экран оплаты,
 # выбор владельца, подтверждение цены. Проверяем маршрут в этих состояниях.
 SCREEN_STATES = [None, "NewOrderSG:confirm", "AddAdminSG:owner",
-                 "EditSettingSG:value"]
+                 "EditSettingSG:value", "EditPromoPriceSG:value"]
 
 
 async def _routed(router, data: str, db, config, chat_id: int,

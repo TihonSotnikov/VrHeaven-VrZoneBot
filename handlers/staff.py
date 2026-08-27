@@ -27,7 +27,14 @@ import reports
 from config import Config
 from db import Actor, Database
 from errors import STALE_BUTTON, cb_int, cb_ints
-from handlers.common import SUPPORT, SUPPORT_TEXT, guide_bytes, guide_caption
+from handlers.common import (
+    SUPPORT,
+    SUPPORT_ASK,
+    SUPPORT_LINE,
+    SUPPORT_TEXT,
+    guide_bytes,
+    guide_caption,
+)
 from markup import h, join
 from messaging import Messenger, document_payload
 from pricing import (
@@ -82,15 +89,14 @@ class NewOrderSG(StatesGroup):
 
 WELCOME_TEXT = join(
     "<b>VR Heaven · Учёт VR-сеансов</b>",
-    "Кабинет команды VR Heaven: оформление заказов, статистика "
-    "и прозрачные начисления",
+    "Кабинет команды клуба: заказы, статистика, выплаты",
     "Для входа используйте логин и пароль, выданные VR Heaven",
 )
 
 ACCESS_CLOSED_TEXT = join(
     "<b>VR Heaven · Учёт VR-сеансов</b>",
     "Доступ к кабинету закрыт",
-    f"По всем вопросам обращайтесь в поддержку: {SUPPORT}",
+    SUPPORT_ASK,
 )
 
 HANDLE_PROMPT = join("<b>Вход в кабинет</b>", "Введите логин")
@@ -103,7 +109,7 @@ BAD_CREDENTIALS = join(
 SUSPENDED_LOGIN_TEXT = join(
     "<b>Вход в кабинет</b>",
     "Учётная запись приостановлена.",
-    f"Обратитесь в VR Heaven: {SUPPORT}",
+    SUPPORT_ASK,
 )
 
 NEW_DEVICE_TEXT = join(
@@ -115,7 +121,7 @@ NEW_DEVICE_TEXT = join(
 SUSPENDED_TEXT = join(
     "<b>Новый заказ</b>",
     "Оформление заказов приостановлено.",
-    f"По всем вопросам обращайтесь в VR Heaven: {SUPPORT}",
+    SUPPORT_ASK,
 )
 
 
@@ -521,12 +527,16 @@ async def order_drop(cb: CallbackQuery, state: FSMContext, db: Database,
     await ui.window(
         cb.message.chat.id,
         join("<b>Заказ не оформлен</b>",
-             h("Сумма {} не записана — деньги не приняты", fmt_money(price)),
+             # Принял администратор деньги или нет — бот не знает и знать
+             # не может; сказать он вправе только о собственной записи
+             h("Сумма {} не записана", fmt_money(price)),
              "Выберите раздел"),
         _menu_kb(user) if user else kb.welcome_kb(),
         source_message_id=cb.message.message_id,
     )
-    await cb.answer("Заказ отменён")
+    # Не «отменён»: отменяют записанный заказ, а этого не было вовсе —
+    # экран и всплывающий ответ обязаны говорить об одном и том же
+    await cb.answer("Заказ не оформлен")
 
 
 def _receipt_text(order, tz) -> str:
@@ -598,17 +608,17 @@ async def order_payment(cb: CallbackQuery, state: FSMContext, db: Database,
                 owner_devices = await notify.to_user(
                     db, tx, owner,
                     join("<b>Новый заказ в вашем клубе</b>",
-                         h("Администратор: {}\nЗаказ: {}\nСумма: {}\nВаша доля: {}\n"
-                           "Накоплено к выплате: {}",
-                           user["handle"], order_row_label(order),
-                           fmt_money(order["price"]), fmt_money(order["owner_share"]),
+                         h("Ваша доля: {}\nК выплате: {}",
+                           fmt_money(order["owner_share"]),
                            fmt_money(total["share_sum"])),
-                         "Выплаты проводятся 1-го и 15-го числа"),
+                         h("Администратор: {}\nЗаказ: {} · {}",
+                           user["handle"], order_row_label(order),
+                           fmt_money(order["price"]))),
                     kind="order_owner", dedup=f"order:{order['id']}:owner")
             await notify.to_super_admins(
                 db, tx, config,
                 join(h("<b>Новый заказ №{}</b>", order["id"]),
-                     h("Администратор: {}\nВладелец: {}\nЗаказ: {}\nСумма: {}",
+                     h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}",
                        user["handle"], order["owner_handle"] or "—",
                        order_row_label(order), fmt_money(order["price"])),
                      h("Вознаграждение администратора (№{} в серии): {}\n"
@@ -682,7 +692,7 @@ async def cancel_list(cb: CallbackQuery, state: FSMContext, db: Database,
             join("<b>Отмена заказа</b>",
                  "Заказов, доступных к отмене, нет.",
                  h("Отменить заказ можно в течение 15 минут после оформления, "
-                   "позже — через поддержку {}", SUPPORT)),
+                   "позже — через поддержку: {}", SUPPORT)),
             kb.to_staff_menu_kb(), source_message_id=cb.message.message_id)
         await cb.answer()
         return
@@ -721,10 +731,11 @@ async def cancel_pick(cb: CallbackQuery, state: FSMContext, db: Database,
     await ui.window(
         cb.message.chat.id,
         join(h("<b>Отмена заказа №{}</b>", order["id"]),
-             h("Заказ: {}\nСумма: {}\nВремя: {}",
-               order_row_label(order), fmt_money(order["price"]),
-               fmt_dt(order["created_at"], config.tz, "%d.%m %H:%M")),
-             "Заказ будет исключён из всех расчётов"),
+             h("Заказ: {}\nВремя: {}\nВаше вознаграждение: {}",
+               order_row_label(order),
+               fmt_dt(order["created_at"], config.tz, "%d.%m %H:%M"),
+               fmt_money(order["admin_share"])),
+             "Заказ и вознаграждение будут исключены из расчёта долей"),
         kb.confirm_kb(f"sc:ok:{order['id']}", "sm"),
         source_message_id=cb.message.message_id)
     await cb.answer()
@@ -751,11 +762,11 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
             await cb.answer()
             return
     cancelled_by = h(
-        "Заказ отменил администратор {}\nКонтакт администратора: {}\n"
-        "Служба поддержки: {}",
-        user["handle"], user["contact"] or "—", SUPPORT)
+        "Заказ отменил администратор {}\nКонтакт администратора: {}\n{}",
+        user["handle"], user["contact"] or "—", SUPPORT_LINE)
     owner_devices = 0
     own_devices = 0
+    own_total = None
     async with db.write() as tx:
         # Условный UPDATE проверяет выплаты в самом запросе: выплата,
         # пришедшая в этот же миг, не может проскочить мимо запрета
@@ -774,9 +785,9 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
             own_devices = await notify.to_user(
                 db, tx, user,
                 join("<b>Заказ отменён</b>",
-                     h("Ваш заказ №{} на сумму {} исключён из расчёта долей\n"
-                       "Накоплено к выплате: {}",
-                       order_id, fmt_money(order["price"]),
+                     h("Ваш заказ №{} исключён из расчёта долей\n"
+                       "Вознаграждение {} снято\nК выплате: {}",
+                       order_id, fmt_money(order["admin_share"]),
                        fmt_money(own_total["due_sum"])),
                      cancelled_by),
                 kind="order_cancelled", dedup=f"cancel:{order_id}:admin",
@@ -785,20 +796,25 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
                 owner = await db.get_user(order["owner_id"])
                 if owner and owner["deleted_at"] is None:
                     total = await db.owner_unpaid_total(owner["id"])
+                    # Доля 0 — заказ оформлен при приостановленном владельце
+                    # (SPEC §7): снимать нечего, и говорить об этом незачем
+                    removed = h("\nВаша доля {} снята",
+                                fmt_money(order["owner_share"])
+                                ) if order["owner_share"] else ""
                     owner_devices = await notify.to_user(
                         db, tx, owner,
                         join("<b>Заказ отменён</b>",
-                             h("Заказ №{} на сумму {} исключён из расчёта долей\n"
-                               "Накоплено к выплате: {}",
-                               order_id, fmt_money(order["price"]),
-                               fmt_money(total["share_sum"])),
+                             h("Заказ №{} исключён из расчёта долей", order_id)
+                             + removed
+                             + h("\nК выплате: {}",
+                                 fmt_money(total["share_sum"])),
                              cancelled_by),
                         kind="order_cancelled",
                         dedup=f"cancel:{order_id}:owner")
             await notify.to_super_admins(
                 db, tx, config,
                 join(h("<b>Заказ №{} отменён</b>", order_id),
-                     h("Администратор: {}\nВладелец: {}\nЗаказ: {}\nСумма: {}",
+                     h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}",
                        order["admin_handle"], order["owner_handle"] or "—",
                        order_row_label(order), fmt_money(order["price"])),
                      cancelled_by),
@@ -812,10 +828,15 @@ async def cancel_confirm(cb: CallbackQuery, state: FSMContext, db: Database,
                         source_message_id=cb.message.message_id)
         await cb.answer()
         return
+    # Инициатор Записи об отмене не получает (SPEC §5) — значит, свою
+    # новую цифру он обязан увидеть здесь: на других устройствах она уже
+    # есть, а на этом экране её иначе не будет нигде
     await ui.window(
         cb.message.chat.id,
         join(h("<b>Заказ №{} отменён</b>", order_id),
-             h("Сумма {} исключена из всех расчётов", fmt_money(order["price"])),
+             h("Вознаграждение {} снято\nК выплате: {}",
+               fmt_money(order["admin_share"]),
+               fmt_money(own_total["due_sum"])),
              notify.devices_note(owner_devices, "Владелец") if owner_devices else "",
              h("Ваши другие устройства уведомлены: {}", own_devices)
              if own_devices else ""),

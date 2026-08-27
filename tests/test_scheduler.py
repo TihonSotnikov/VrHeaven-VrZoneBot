@@ -61,10 +61,15 @@ async def test_payout_day_reports_reach_everyone_with_a_share(
     assert 102 not in reached                       # без заказов — без отчёта
 
     owner_report = bot.records(OWNER_CHAT)[0]
-    assert "Накоплено к выплате" in owner_report
+    assert "К выплате на " in owner_report
     assert "Выплата проводится вручную" in owner_report
     # период закрывает выплата, а не календарь — обещания «период закрыт» нет
     assert "Учётный период закрыт" not in owner_report
+    # приписка ровно одна: сегодняшняя заменяет обычную про календарь,
+    # иначе внизу стояли бы две фразы об одном и том же
+    import reports as rp
+    assert rp.PERIOD_NOTE not in owner_report
+    assert rp.PERIOD_NOTE not in bot.records(ADMIN_CHAT)[0]
     vr_report = bot.records(next(iter(VR_ADMIN_IDS)))[0]
     assert "Остаток VR Heaven: 474 ₽" in vr_report
 

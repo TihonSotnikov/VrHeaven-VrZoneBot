@@ -135,6 +135,11 @@ async def test_owner_and_super_admins_get_records(db, ui, config, bot, worker):
 
     owner_texts = [t for c, _, t in bot.sent if c == OWNER_CHAT]
     assert owner_texts and "Ваша доля: 90 ₽" in owner_texts[0]
+    # Итог периода называется так же, как на экранах владельца
+    assert "К выплате: 90 ₽" in owner_texts[0]
+    assert "Накоплено" not in owner_texts[0]
+    # Деньги владельца — первыми, детали заказа под ними
+    assert owner_texts[0].index("Ваша доля") < owner_texts[0].index("Администратор")
     assert "Остаток" not in owner_texts[0]        # владельцу — только его доля
 
     for admin_id in VR_ADMIN_IDS:

@@ -7,7 +7,10 @@ VR Heaven выгружает всё и с полным распределени�
 распределение заказа не показывается никогда).
 
 Разделитель `;`, кодировка UTF-8 с BOM — файлы открываются в Excel
-без настройки.
+без настройки, а кириллица читается и в телефоне: Bot API отдаёт документ
+без указания кодировки, и подпись — единственный сигнал, который доезжает
+до просмотрщика. Значения, которые таблица приняла бы за формулу, уходят
+помеченными как текст (см. `_cell`).
 """
 
 import csv
@@ -48,11 +51,25 @@ ACTION_LABELS = {
 }
 
 
+# Excel и LibreOffice считают формулой всё, что начинается с = + - @:
+# контакт «+7 999 …» превращается в число 79991234567, а подставленное
+# в имя «=...» — в выполняемую формулу. Апостроф перед значением —
+# штатная для таблиц пометка «это текст»: ячейка показывает исходную
+# строку и ничего не считает. Числа и даты идут в файл как есть.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value):
+    if isinstance(value, str) and value.startswith(_FORMULA_LEAD):
+        return "'" + value
+    return value
+
+
 def _csv_bytes(headers: list[str], rows: list[list]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
     writer.writerow(headers)
-    writer.writerows(rows)
+    writer.writerows([_cell(v) for v in row] for row in rows)
     return buf.getvalue().encode("utf-8-sig")
 
 
@@ -195,8 +212,13 @@ def _actor(row, *, with_ids: bool) -> str:
     return "система"
 
 
-def _changes(row) -> str:
-    """Что именно изменилось — одной читаемой строкой."""
+def _changes(row, allow: frozenset[str] | None = None) -> str:
+    """Что именно изменилось — одной читаемой строкой.
+
+    `allow` — набор полей, которые вообще разрешено показывать. Он задан
+    только для файла владельца; None означает «показывать всё» (VR Heaven
+    видит журнал целиком).
+    """
     parts = []
     for label, key in (("было", "before_json"), ("стало", "after_json")):
         if not row[key]:
@@ -206,8 +228,14 @@ def _changes(row) -> str:
         except ValueError:
             value = row[key]
         if isinstance(value, dict):
+            if allow is not None:
+                value = {k: v for k, v in value.items() if k in allow}
+            if not value:
+                continue
             parts.append(f"{label}: " + ", ".join(f"{k}={v}" for k, v in value.items()))
-        else:
+        elif allow is None:
+            # Запись не словарём — разобрать её по полям нечем, поэтому
+            # в ограниченный файл она не попадает вовсе
             parts.append(f"{label}: {value}")
     return " · ".join(parts)
 
@@ -224,12 +252,43 @@ def audit_csv(rows, tz: ZoneInfo) -> bytes:
     )
 
 
+# Какие поля изменений владелец видит в журнале — по действию.
+#
+# Отбор здесь тот же, что в колонках его же файлов: цена заказа и его
+# доля — да; вознаграждение администратора, номер в лесенке серии, долг
+# и компенсирующий бонус при отмене, время сбросов серии — нет, это
+# внутренний расчёт VR Heaven. Telegram-идентификаторов в файле владельца
+# нет нигде, а `chat_id` личного чата равен идентификатору пользователя,
+# поэтому он тоже не показывается.
+#
+# Список закрытый: у действия, которого здесь нет, строка в файл попадёт,
+# а подробности — нет. Новое поле в журнале не может утечь владельцу само
+# по себе; чтобы оно появилось в его файле, его надо внести сюда.
+OWNER_AUDIT_FIELDS: dict[str, frozenset[str]] = {
+    "order.create": frozenset({"price", "owner_share"}),
+    "order.cancel": frozenset({"cancelled", "by", "price"}),
+    "payout.create": frozenset({"user", "amount", "orders"}),
+    "user.create": frozenset({"role", "handle", "owner"}),
+    "user.suspend": frozenset({"is_active"}),
+    "user.activate": frozenset({"is_active"}),
+    "user.delete": frozenset({"handle", "role", "deleted"}),
+    "user.password": frozenset({"chats_unbound"}),
+    "user.percent": frozenset({"percent"}),
+    "user.owner": frozenset({"owner"}),
+    "user.login": frozenset({"new_device"}),
+    "chat.unbind": frozenset({"reason"}),
+    "export.download": frozenset({"files"}),
+}
+
+
 def owner_audit_csv(rows, tz: ZoneInfo) -> bytes:
-    """Журнал действий владельца: только его данные, без Telegram-идентификаторов."""
+    """Журнал действий владельца: только его данные, без Telegram-идентификаторов
+    и без внутреннего расчёта VR Heaven (см. OWNER_AUDIT_FIELDS)."""
     return _csv_bytes(
         ["дата", "кто", "действие", "объект", "id_объекта", "изменения"],
         [[fmt_dt(r["at"], tz), _actor(r, with_ids=False),
           ACTION_LABELS.get(r["action"], r["action"]), r["entity"],
-          r["entity_id"] or "", _changes(r)]
+          r["entity_id"] or "",
+          _changes(r, allow=OWNER_AUDIT_FIELDS.get(r["action"], frozenset()))]
          for r in rows],
     )

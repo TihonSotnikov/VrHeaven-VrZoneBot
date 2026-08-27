@@ -9,10 +9,11 @@ drain(), сам цикл с пробуждением и остановом не 
 import asyncio
 
 import pytest
-from helpers import bind, create_admin, set_window
+from helpers import bind, create_admin, make_order, set_window
 
+import backup as bk
 import notify
-from main import SingleInstance
+from main import SingleInstance, boot_backup
 
 
 def test_second_instance_on_the_same_data_directory_refuses_to_start(tmp_path):
@@ -90,3 +91,65 @@ async def test_worker_loop_survives_a_failing_batch(db, ui, bot, worker):
         await worker.stop()
     dead = await db.fetchone("SELECT status FROM outbox WHERE chat_id = 77")
     assert dead["status"] == "dropped"
+
+
+# ------------------------------------------------ Копия не срывается о деньги
+
+async def _series_with_a_cancelled_order(db):
+    """Законная серия, в которой отменён заказ из середины: следующий
+    заказ занял освободившуюся ступень (SPEC §3)."""
+    admin = await create_admin(db)
+    boundary = "2026-08-20T02:00:00+00:00"
+    first = await make_order(db, admin, price=300, series_pos=1,
+                             series_since=boundary,
+                             created_at="2026-08-20T08:00:00+00:00")
+    await make_order(db, admin, price=300, series_pos=2, series_since=boundary,
+                     created_at="2026-08-20T08:10:00+00:00")
+    async with db.write() as tx:
+        await db.cancel_order(tx, first, for_self=False)
+    await make_order(db, admin, price=300, series_pos=2, series_since=boundary,
+                     created_at="2026-08-20T08:20:00+00:00")
+    return admin
+
+
+async def test_boot_snapshot_survives_a_cancelled_order(db, config):
+    """Копия перед запуском — то состояние, к которому можно вернуться.
+    Одна законная отмена делала её невозможной навсегда: проверка считала
+    освободившуюся ступень порчей, копия не публиковалась, обновить бота
+    было нечем."""
+    await _series_with_a_cancelled_order(db)
+    await boot_backup(config)
+    published = bk.list_backups(config.backup_dir)
+    assert published, "копия обязана появиться"
+    assert published[0].reason == bk.REASON_BOOT
+
+
+async def test_a_discrepancy_at_boot_is_written_to_the_journal(db, config,
+                                                              caplog):
+    """Копия снимается, а расхождение не пропадает: молчаливое «всё
+    хорошо» здесь опаснее отказа, потому что разбирать будет некому."""
+    import logging
+
+    from main import boot_backup
+    admin = await create_admin(db)
+    await make_order(db, admin, price=300)
+    async with db.write() as tx:
+        await tx.execute("UPDATE orders SET owner_share = 1")
+    with caplog.at_level(logging.ERROR):
+        await boot_backup(config)
+    assert bk.list_backups(config.backup_dir), "копия обязана появиться"
+    assert any("деловые инварианты не сходятся" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_pre_migration_snapshot_is_taken_despite_a_discrepancy(db, config):
+    """Снимок перед миграцией — единственная точка отката схемы. Деньги,
+    которые не сходятся, его не отменяют: без снимка мигрировать нельзя,
+    а расхождение уезжает вместе с копией тревогой."""
+    admin = await create_admin(db)
+    await make_order(db, admin, price=300)
+    async with db.write() as tx:
+        await tx.execute("UPDATE orders SET owner_share = 1")
+    info = await bk.create_backup(config, bk.REASON_PRE_MIGRATION)
+    assert info.problems, "расхождение обязано остаться видимым"
+    assert bk.list_backups(config.backup_dir), "снимок обязан появиться"

@@ -102,6 +102,23 @@ class Actor:
         return Actor(kind="staff", tg_id=tg_id, user_id=user_row["id"])
 
 
+@dataclass(frozen=True)
+class Cancellation:
+    """Чем кончилась отмена заказа.
+
+    В логическом значении — «отмена состоялась», поэтому `if cancelled:`
+    читается ровно как прежде. Долг здесь для того, чтобы о нём сказали
+    вслух: сумма, которую администратор уже получил за отменённый заказ,
+    записана удержанием, и уведомления обязаны её назвать.
+    """
+    done: bool
+    debt: float = 0.0             # выплаченное вознаграждение, ставшее удержанием
+    bonus_id: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.done
+
+
 class Tx:
     """Открытая транзакция. Единственный способ что-либо записать."""
 
@@ -537,20 +554,45 @@ class Database:
             f"{self._ORDER_SELECT} WHERE o.id = ?", (order_id,)
         )
 
-    async def cancel_order(self, tx: Tx, order_id: int, *, for_self: bool) -> bool:
+    async def cancel_order(self, tx: Tx, order_id: int, *,
+                           for_self: bool) -> "Cancellation":
         """Мягкая отмена: заказ исключается из расчётов, но остаётся в истории.
 
         Условный UPDATE: двойное нажатие и параллельная отмена дают один
         эффект. Самоотмена дополнительно проверяет выплаты в самом UPDATE —
         выплата, пришедшая в тот же миг, не может проскочить мимо запрета.
         VR Heaven отменяет и выплаченный заказ: это надзорное действие.
+
+        Выплаченное вознаграждение отменой не возвращается само: деньги у
+        администратора на руках, а заказ уходит из всех расчётов. Прежде
+        эта сумма просто исчезала из учёта. Теперь она становится
+        удержанием — тем самым отрицательным бонусом, которым VR Heaven
+        и так правит расчёты (SPEC §3а): попадает в текущий период
+        администратора, вычитается из ближайшей выплаты и, пока не
+        выплачена, отменяется обычной кнопкой. Проведённая выплата при
+        этом не переписывается (SPEC §5).
+
+        Состояние заказа перечитывается **после** условного UPDATE и в
+        той же транзакции: выплата, прошедшая между чтением экрана и
+        нажатием, попадёт в долг, а не мимо него.
         """
         sql = ("UPDATE orders SET cancelled_at = ?"
                " WHERE id = ? AND cancelled_at IS NULL")
         if for_self:
             sql += " AND admin_payout_id IS NULL AND owner_payout_id IS NULL"
         cur = await tx.execute(sql, (utcnow_iso(), order_id))
-        return cur.rowcount > 0
+        if not cur.rowcount:
+            return Cancellation(done=False)
+        order = await tx.fetchone(
+            "SELECT admin_id, admin_share, admin_payout_id FROM orders"
+            " WHERE id = ?", (order_id,))
+        debt = round(order["admin_share"], 2)
+        if order["admin_payout_id"] is None or not debt:
+            return Cancellation(done=True)
+        bonus_id = await self.create_bonus(
+            tx, order["admin_id"], -debt,
+            f"Возврат вознаграждения за отменённый заказ №{order_id}")
+        return Cancellation(done=True, debt=debt, bonus_id=bonus_id)
 
     async def count_series_orders(self, admin_id: int, since_iso: str) -> int:
         """Неотменённые заказы администратора с начала его текущей серии."""
@@ -593,7 +635,10 @@ class Database:
 
     async def admin_unpaid_total(self, admin_id: int) -> aiosqlite.Row:
         """Текущий период администратора: заказы, оборот, доля по заказам,
-        невыплаченные бонусы и итог к выплате (доля + бонусы)."""
+        невыплаченные бонусы и итог к выплате (доля + бонусы).
+
+        Строки считаются, а не только суммируются: период из настоящих
+        строк обязан закрываться и тогда, когда его итог — ноль."""
         return await self.fetchone(
             "SELECT COUNT(*) AS orders_count,"
             " COALESCE(SUM(price), 0) AS turnover,"
@@ -601,13 +646,16 @@ class Database:
             " (SELECT COALESCE(SUM(amount), 0) FROM bonuses"
             "   WHERE admin_id = ? AND payout_id IS NULL AND cancelled_at IS NULL)"
             "   AS bonus_sum,"
+            " (SELECT COUNT(*) FROM bonuses"
+            "   WHERE admin_id = ? AND payout_id IS NULL AND cancelled_at IS NULL)"
+            "   AS bonus_count,"
             " COALESCE(SUM(admin_share), 0)"
             " + (SELECT COALESCE(SUM(amount), 0) FROM bonuses"
             "     WHERE admin_id = ? AND payout_id IS NULL AND cancelled_at IS NULL)"
             "   AS due_sum"
             " FROM orders WHERE admin_id = ?"
             " AND admin_payout_id IS NULL AND cancelled_at IS NULL",
-            (admin_id, admin_id, admin_id),
+            (admin_id, admin_id, admin_id, admin_id),
         )
 
     async def owner_unpaid_orders(self, owner_id: int) -> list[aiosqlite.Row]:
@@ -626,6 +674,7 @@ class Database:
             " COALESCE(SUM(price), 0) AS turnover,"
             " COALESCE(SUM(owner_share), 0) AS share_sum,"
             " 0 AS bonus_sum,"
+            " 0 AS bonus_count,"            # бонусы бывают только у администратора
             " COALESCE(SUM(owner_share), 0) AS due_sum"
             " FROM orders WHERE owner_id = ?"
             " AND owner_payout_id IS NULL AND cancelled_at IS NULL",
@@ -636,19 +685,21 @@ class Database:
     def is_payable(total) -> bool:
         """Есть ли что закрывать выплатой по агрегату текущего периода.
 
-        Нулевое накопление выплате не подлежит (SPEC §4), но ноль бывает
-        двух видов. Не начислено ничего — платить нечего. Начислено, а
-        потом удержано ровно столько же — строки настоящие, и период
-        обязан закрываться: иначе заказ и удержание остаются открытыми
-        навсегда и тянутся в каждый следующий период.
+        Судим по открытым строкам, а не по сумме. Нулевой итог
+        выплате не подлежит (SPEC §4), но ноль бывает разного
+        происхождения. Не начислено ничего — строк нет, и платить нечего.
+        Начислено и ровно столько же удержано — строки настоящие. Заказ,
+        оформленный при приостановленном владельце, несёт долю 0 и тоже
+        настоящий: владелец обязан его закрыть, иначе заказ остаётся
+        открытым навсегда, тянется в каждый следующий период и вечно
+        числится в остатке VR Heaven.
 
         Отрицательный итог не выплачивается никогда: удержание, которое
         больше начисленного, переносится в следующий период.
         """
-        due = round(total["due_sum"], 2)
-        if due:
-            return due > 0
-        return bool(round(total["share_sum"], 2) or round(total["bonus_sum"], 2))
+        if round(total["due_sum"], 2) < 0:
+            return False
+        return bool(total["orders_count"] or total["bonus_count"])
 
     async def unpaid_total(self, user: aiosqlite.Row) -> aiosqlite.Row:
         """Текущий период получателя — агрегат по его невыплаченной доле
@@ -656,18 +707,6 @@ class Database:
         if user["role"] == "admin":
             return await self.admin_unpaid_total(user["id"])
         return await self.owner_unpaid_total(user["id"])
-
-    async def admin_today_total(self, admin_id: int, since_iso: str) -> aiosqlite.Row:
-        """Заказы администратора с момента since (неотменённые, включая
-        выплаченные) — строка «Сегодня» в его статистике."""
-        return await self.fetchone(
-            "SELECT COUNT(*) AS orders_count,"
-            " COALESCE(SUM(price), 0) AS turnover,"
-            " COALESCE(SUM(admin_share), 0) AS share_sum"
-            " FROM orders WHERE admin_id = ?"
-            " AND cancelled_at IS NULL AND created_at >= ?",
-            (admin_id, since_iso),
-        )
 
     async def owners_unpaid_summary(self) -> list[aiosqlite.Row]:
         """Сводка текущего периода по каждому не удалённому владельцу."""
@@ -677,6 +716,7 @@ class Database:
             " COALESCE(SUM(o.price), 0) AS turnover,"
             " COALESCE(SUM(o.owner_share), 0) AS share_sum,"
             " 0 AS bonus_sum,"
+            " 0 AS bonus_count,"
             " COALESCE(SUM(o.owner_share), 0) AS due_sum"
             " FROM users u"
             " LEFT JOIN orders o ON o.owner_id = u.id"
@@ -696,6 +736,9 @@ class Database:
             " (SELECT COALESCE(SUM(b.amount), 0) FROM bonuses b"
             "   WHERE b.admin_id = u.id AND b.payout_id IS NULL"
             "   AND b.cancelled_at IS NULL) AS bonus_sum,"
+            " (SELECT COUNT(*) FROM bonuses b"
+            "   WHERE b.admin_id = u.id AND b.payout_id IS NULL"
+            "   AND b.cancelled_at IS NULL) AS bonus_count,"
             " COALESCE(SUM(o.admin_share), 0)"
             " + (SELECT COALESCE(SUM(b.amount), 0) FROM bonuses b"
             "     WHERE b.admin_id = u.id AND b.payout_id IS NULL"
@@ -854,6 +897,18 @@ class Database:
         агрегату — двойное нажатие и гонка двух супер-админов дают ровно
         одну выплату. Возвращает (id, сумма, число заказов, сумма бонусов)
         или None, если платить нечего.
+
+        Итог меньше нуля выплатой не бывает (SPEC §4): удержание, которое
+        больше начисленного, переносится в следующий период. Правило живёт
+        здесь, а не только на экране подтверждения: экран мог быть собран
+        до удержания, пришедшего секунду назад, и любой другой вызывающий
+        обязан получить ту же защиту. Отрицательный итог откатывает
+        пометки — строки остаются открытыми и ждут периода, в котором
+        итог станет неотрицательным.
+
+        Ноль при закрытых строках — законная выплата: начислено и ровно
+        столько же удержано, строки настоящие, и период обязан
+        закрываться, иначе он тянется вечно.
         """
         if user["role"] == "admin":
             user_col, payout_col, share_col = "admin_id", "admin_payout_id", "admin_share"
@@ -880,7 +935,7 @@ class Database:
             )
             closed_bonuses = cur.rowcount
         if closed_orders == 0 and closed_bonuses == 0:
-            await tx.execute("DELETE FROM payouts WHERE id = ?", (payout_id,))
+            await self._undo_payout(tx, payout_id, payout_col)
             return None
         closed = await tx.fetchone(
             f"SELECT COUNT(*) AS orders_count, COALESCE(SUM({share_col}), 0) AS total"
@@ -896,11 +951,29 @@ class Database:
             )
             bonus_total = round(row["total"], 2)
         amount = round(closed["total"] + bonus_total, 2)
+        if amount < 0:
+            await self._undo_payout(tx, payout_id, payout_col)
+            return None
         await tx.execute(
             "UPDATE payouts SET amount = ?, orders_count = ? WHERE id = ?",
             (amount, closed["orders_count"], payout_id),
         )
         return payout_id, amount, closed["orders_count"], bonus_total
+
+    async def _undo_payout(self, tx: Tx, payout_id: int, payout_col: str) -> None:
+        """Снимает пометки выплаты, которой не будет, и убирает её саму.
+
+        Отпускаются ровно те строки, которые пометила эта выплата: уже
+        выплаченного не касается, следа в базе не остаётся.
+        """
+        await tx.execute(
+            f"UPDATE orders SET {payout_col} = NULL WHERE {payout_col} = ?",
+            (payout_id,),
+        )
+        await tx.execute(
+            "UPDATE bonuses SET payout_id = NULL WHERE payout_id = ?", (payout_id,)
+        )
+        await tx.execute("DELETE FROM payouts WHERE id = ?", (payout_id,))
 
     async def payouts_for_user(self, user_id: int, limit: int = 30) -> list[aiosqlite.Row]:
         return await self.fetchall(
