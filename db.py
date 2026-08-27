@@ -81,6 +81,35 @@ SETTINGS_DEFAULTS: dict[str, float] = {
     "pc_bonus_points": 100,
 }
 
+# --------------------------------------------- Остаток VR Heaven: одно место
+#
+# Итог сводки и её построчная расшифровка обязаны считаться одинаково,
+# иначе столбец «Остаток VR Heaven» и подвал под ним расходятся. Оба
+# запроса собираются из этих двух кусков и другого источника не имеют.
+
+# Остаток VR Heaven по одному заказу: цена за вычетом тех долей, которые
+# получателям достанутся. Доля остаётся у VR Heaven ровно в одном случае —
+# она не выплачена, а получателя больше нет (SPEC §4).
+VR_SHARE_EXPR = (
+    "o.price"
+    " - CASE WHEN o.admin_payout_id IS NOT NULL OR a.deleted_at IS NULL"
+    "        THEN o.admin_share ELSE 0 END"
+    " - CASE WHEN o.owner_id IS NULL THEN 0"
+    "        WHEN o.owner_payout_id IS NOT NULL OR w.deleted_at IS NULL"
+    "        THEN o.owner_share ELSE 0 END"
+)
+
+# Заказы текущего периода сводки: неотменённые, у которых открыта хотя бы
+# одна доля. Ровно те, что видны в таблицах сводки.
+VR_OPEN_ORDERS_FROM = (
+    "FROM orders o"
+    " JOIN users a ON a.id = o.admin_id"
+    " LEFT JOIN users w ON w.id = o.owner_id"
+    " WHERE o.cancelled_at IS NULL"
+    " AND (o.admin_payout_id IS NULL"
+    "  OR (o.owner_id IS NOT NULL AND o.owner_payout_id IS NULL))"
+)
+
 
 @dataclass(frozen=True)
 class Actor:
@@ -767,20 +796,25 @@ class Database:
         return await self.fetchone(
             "SELECT COUNT(*) AS orders_count,"
             " COALESCE(SUM(o.price), 0) AS turnover,"
-            " COALESCE(SUM("
-            "   o.price"
-            "   - CASE WHEN o.admin_payout_id IS NOT NULL OR a.deleted_at IS NULL"
-            "          THEN o.admin_share ELSE 0 END"
-            "   - CASE WHEN o.owner_id IS NULL THEN 0"
-            "          WHEN o.owner_payout_id IS NOT NULL OR w.deleted_at IS NULL"
-            "          THEN o.owner_share ELSE 0 END"
-            " ), 0) AS share_sum"
-            " FROM orders o"
-            " JOIN users a ON a.id = o.admin_id"
-            " LEFT JOIN users w ON w.id = o.owner_id"
-            " WHERE o.cancelled_at IS NULL"
-            " AND (o.admin_payout_id IS NULL"
-            "  OR (o.owner_id IS NOT NULL AND o.owner_payout_id IS NULL))"
+            f" COALESCE(SUM({VR_SHARE_EXPR}), 0) AS share_sum"
+            f" {VR_OPEN_ORDERS_FROM}"
+        )
+
+    async def vrheaven_unpaid_orders(self) -> list[aiosqlite.Row]:
+        """Те же заказы построчно: цена и остаток VR Heaven по каждому.
+
+        Строки берутся тем же выражением и тем же условием, что и итог
+        (`VR_SHARE_EXPR`, `VR_OPEN_ORDERS_FROM`), — иначе столбец
+        «Остаток VR Heaven» в таблице и «Остаток VR Heaven» в подвале
+        разошлись бы при первой же правке одного из двух запросов.
+        Сумма столбца равна `share_sum` итога до вычета бонусов: бонус
+        не принадлежит ни одному заказу.
+        """
+        return await self.fetchall(
+            "SELECT o.id, o.price, a.handle AS admin_handle,"
+            f" {VR_SHARE_EXPR} AS vr_share"
+            f" {VR_OPEN_ORDERS_FROM}"
+            " ORDER BY o.id"
         )
 
     async def owner_admins_summary(self, owner_id: int) -> list[aiosqlite.Row]:

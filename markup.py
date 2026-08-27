@@ -133,6 +133,18 @@ class Table:
     rows: list[list]
 
 
+def breaks(text: str) -> str:
+    """Переводы строк — тегом <br>, а не символом.
+
+    Внутри <p> нативного сообщения (Rich Messages) «\n» — обычный пробел
+    разметки, как в любом HTML: пять фактов подвала сводки склеивались в
+    одну нечитаемую строку. Абзац отчёта собирается через «\n» повсюду,
+    поэтому перевод строки превращается в разрыв здесь, в единственной
+    точке сборки, — а не в каждом отчёте по отдельности.
+    """
+    return text.replace("\n", "<br>")
+
+
 @dataclass
 class Report:
     """Отчёт, независимый от способа показа.
@@ -162,7 +174,7 @@ class Report:
             if isinstance(block, Table):
                 parts.append(table_html(block) if rich else pre_table(block))
             elif rich:
-                parts.append(f"<p>{block}</p>")
+                parts.append(f"<p>{breaks(block)}</p>")
             else:
                 parts.append(block)
         text = separator.join(parts)

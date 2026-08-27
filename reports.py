@@ -84,6 +84,14 @@ async def vrheaven_summary(db: Database) -> Report:
     вместе с ней и из остатка внизу — он считается по показанным строкам.
     Счёт строк заодно оставляет на виду того, у кого бонус и удержание
     сошлись в ноль: платить ему нечего, а закрыть период всё равно надо.
+
+    Таблица «Заказы» — единственное место в боте, где рядом стоят цена
+    заказа и остаток VR Heaven по нему. Обе цифры принадлежат только
+    VR Heaven: администратору цена не нужна (вознаграждение считается
+    лесенкой), владельцу не показывается ничего, кроме его доли
+    (SPEC §6), а полное распределение владелец не видит никогда. Сводка
+    собирается единственным вызовом из панели VR Heaven и рассылки дня
+    выплат — обе точки закрыты фильтром супер-админа.
     """
     report = Report("Сводка за текущий период")
     owners = [r for r in await db.owners_unpaid_summary()
@@ -101,27 +109,52 @@ async def vrheaven_summary(db: Database) -> Report:
         table, admins_total = _summary_table(admins, with_bonus=True)
         report.add(h("<b>Администраторы</b>")).add(table)
         bonus_total = round(sum(r["bonus_sum"] for r in admins), 2)
+    orders = await db.vrheaven_unpaid_orders()
+    if orders:
+        shown = orders[-MAX_TABLE_ROWS:]
+        report.add(h("<b>Заказы</b>")).add(Table(
+            ["Заказ", "Админ", "Цена, ₽", "Остаток VR Heaven, ₽"],
+            [[f"№{o['id']}", o["admin_handle"], fmt_num(o["price"]),
+              fmt_num(o["vr_share"])] for o in shown],
+        ))
+        if len(orders) > MAX_TABLE_ROWS:
+            report.add(h("Показаны последние {} из {} заказов",
+                         MAX_TABLE_ROWS, len(orders)))
     vr_total = await db.vrheaven_unpaid_total()
     vr_remainder = round(vr_total["share_sum"] - bonus_total, 2)
-    footer = h("Заказов за период: {} · оборот {}",
+    # По факту на строку: пять величин в одну строку не читаются, а внутри
+    # нативного сообщения «\n» ещё и схлопывается в пробел — перевод строки
+    # превращается в разрыв на сборке отчёта (markup.Report.to_html)
+    footer = h("Заказов за период: {}\nОборот: {}",
                vr_total["orders_count"], fmt_money(vr_total["turnover"]))
     footer += h("\n<b>К выплате владельцам: {}</b>"
                 "\n<b>К выплате администраторам: {}</b>",
                 fmt_money(owners_total), fmt_money(admins_total))
     if bonus_total:
+        # Столбец «Остаток VR Heaven» суммируется в остаток по заказам, а
+        # не в итоговый: бонус не принадлежит ни одному заказу и вычитается
+        # из остатка целиком. Без этой строки сумма столбца не сходится с
+        # подвалом, и сходиться ей не с чем
         footer += h("\nв том числе бонусы: {}", fmt_money(bonus_total))
+        footer += h("\nОстаток по заказам: {}",
+                    fmt_money(vr_total["share_sum"]))
     footer += h("\n<b>Остаток VR Heaven: {}</b>", fmt_money(vr_remainder))
     return report.add(footer)
 
 
 async def _series_line(db: Database, user, tz: ZoneInfo) -> str:
-    """Место в текущей 12-часовой серии и цена следующего заказа."""
+    """Место в текущей 12-часовой серии и цена следующего заказа.
+
+    Две строки, а не одна: сделанное и следующая ступень — разные факты,
+    и вторую администратор ищет глазами чаще первой.
+    """
     reset_min = normalize_reset(user["series_reset_min"])
     since_iso, start_local = series_start_utc_iso(reset_min, tz)
     in_series = await db.count_series_orders(user["id"], since_iso)
-    return h("Серия с {}: заказов {} · следующий — {}",
-             start_local.strftime("%H:%M"), in_series,
-             fmt_money(ladder_amount(in_series + 1)))
+    return lines(
+        h("Серия с {}: заказов {}", start_local.strftime("%H:%M"), in_series),
+        h("Следующий заказ: {}", fmt_money(ladder_amount(in_series + 1))),
+    )
 
 
 async def admin_period(db: Database, user, tz: ZoneInfo, *,
@@ -266,12 +299,17 @@ async def daily_digest(db: Database, tz: ZoneInfo, *, errors: int,
     outbox = await db.outbox_stats()
     # Два блока, а не пять абзацев: сначала дела клуба, потом состояние
     # самого бота. Пять пустых строк между однострочными фактами
-    # растягивали сводку на экран, ничего к ней не добавляя
-    report.add(h("Заказов за сутки: {} · оборот {} · отмен {}",
-                 orders["n"], fmt_money(orders["turnover"]), cancelled["n"]))
+    # растягивали сводку на экран, ничего к ней не добавляя. Внутри блока —
+    # по факту на строку: заказы, оборот и отмены мерят разное
     report.add(lines(
-        h("Доставка: в очереди {} · не доставлено {} · отброшено {}",
-          outbox["pending"], outbox["failed"], outbox["dropped"]),
+        h("Заказов за сутки: {}", orders["n"]),
+        h("Оборот: {}", fmt_money(orders["turnover"])),
+        h("Отмен: {}", cancelled["n"]),
+    ))
+    report.add(lines(
+        h("Доставка в очереди: {}", outbox["pending"]),
+        h("Не доставлено: {}", outbox["failed"]),
+        h("Отброшено: {}", outbox["dropped"]),
         h("Ошибок в работе: {}", errors),
         backup_note,
     ))

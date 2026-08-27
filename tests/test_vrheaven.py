@@ -18,6 +18,7 @@ from handlers.vrheaven import (
     AddAdminSG,
     AddOwnerSG,
     SuperAdminFilter,
+    _user_card_text,
     admin_add_contact,
     admin_add_handle,
     admin_add_name,
@@ -26,6 +27,7 @@ from handlers.vrheaven import (
     discount_day_toggle,
     discount_days_menu,
     export_csv,
+    order_cancel_pick,
     owner_add_contact,
     owner_add_handle,
     owner_add_name,
@@ -423,6 +425,77 @@ async def test_summary_shows_the_vrheaven_remainder(db, ui):
     await summary(_cb("sum"), make_state(db, VR_CHAT), db, ui)
     text = await window_text(db, VR_CHAT)
     assert "Остаток VR Heaven: 474 ₽" in text
+
+
+async def test_summary_screen_shows_the_price_and_remainder_of_each_order(db, ui):
+    """Экран сводки — единственное место, где супер-админ видит по заказу
+    и цену клиента, и то, что с этого заказа осталось VR Heaven."""
+    await _panel(db)
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=790, admin_share=79,
+                     owner_percent=30)
+    await make_order(db, admin, owner, price=300, admin_share=250,
+                     owner_percent=30)
+    await summary(_cb("sum"), make_state(db, VR_CHAT), db, ui)
+    text = await window_text(db, VR_CHAT)
+
+    assert "Цена, ₽" in text and "Остаток VR Heaven, ₽" in text
+    assert "790" in text and "474" in text            # 790 − 79 − 237
+    assert "300" in text and "−40" in text            # 300 − 250 − 90 — минус
+
+
+async def test_the_summary_screen_is_closed_to_staff(db, config):
+    """Цена заказа и остаток VR Heaven живут за фильтром супер-админа:
+    у владельца и администратора кнопки «Сводка» нет, а нажатие чужой
+    кнопки до хендлера не доходит."""
+    flt = SuperAdminFilter()
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await bind(db, owner, 4001)
+    await bind(db, admin, 4002)
+
+    assert await flt(fake_cb("sum", chat_id=4001), db, config) is False
+    assert await flt(fake_cb("sum", chat_id=4002), db, config) is False
+    assert await flt(fake_cb("sum", chat_id=VR_CHAT), db, config) is True
+
+
+async def test_order_card_puts_each_share_of_the_split_on_its_own_line(db, ui, config):
+    """Три доли заказа — три строки: деление читают по вертикали."""
+    await _panel(db)
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700, admin_share=150,
+                     owner_percent=30)
+    await order_cancel_pick(_cb("ac:o:1"), db, ui, config)
+    text = await window_text(db, VR_CHAT)
+
+    assert "Вознаграждение: 150 ₽\nДоля владельца: 210 ₽\n" in text
+    assert "Остаток VR Heaven: 340 ₽" in text
+
+
+async def test_payout_confirmation_puts_each_metric_on_its_own_line(db, ui):
+    await _panel(db)
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700, admin_share=150,
+                     owner_percent=30)
+    await payout_pick(_cb(f"po:p:{admin['id']}"), db, ui)
+    text = await window_text(db, VR_CHAT)
+
+    assert "Заказов в периоде: 1\nОборот: 700 ₽" in text
+
+
+async def test_user_card_puts_the_bonus_note_on_its_own_line(db, ui):
+    await _panel(db)
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700, admin_share=150)
+    async with db.write() as tx:
+        await db.create_bonus(tx, admin["id"], 200.0, "за инициативу")
+    text = await _user_card_text(db, await db.get_user(admin["id"]))
+
+    assert "К выплате: 350 ₽\nв том числе бонусы: +200 ₽" in text
 
 
 async def test_stale_button_gets_an_explicit_answer(db, ui):

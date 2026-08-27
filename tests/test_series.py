@@ -143,7 +143,7 @@ async def test_statistics_show_the_series_and_the_next_step(db, ui, config, monk
     _freeze(monkeypatch, datetime(2026, 8, 12, 12, 0, tzinfo=tz))
     html = (await reports.admin_period(db, admin, tz)).to_html(rich=False)
     assert "Серия с 09:00: заказов 1" in html
-    assert "следующий — 100 ₽" in html
+    assert "Следующий заказ: 100 ₽" in html
 
 
 # ------------------- Граница серии живёт в заказе, а не в настройке

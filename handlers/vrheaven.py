@@ -291,11 +291,13 @@ def _order_card_text(order, config: Config) -> str:
                  fmt_dt(order["cancelled_at"], config.tz))
     return join(
         h("<b>Заказ №{}</b>", order["id"]),
-        h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}\nДата: {}\n"
-          "Вознаграждение: {} · доля владельца: {} · остаток: {}",
+        h("Администратор: {}\nВладелец: {}\nЗаказ: {} · {}\nДата: {}",
           order["admin_handle"], order["owner_handle"] or "—",
           order_row_label(order), fmt_money(order["price"]),
-          fmt_dt(order["created_at"], config.tz),
+          fmt_dt(order["created_at"], config.tz)),
+        # Три доли — три строки: деление заказа читают по вертикали, а
+        # не выискивают суммы между точками в одной строке
+        h("Вознаграждение: {}\nДоля владельца: {}\nОстаток VR Heaven: {}",
           fmt_money(order["admin_share"]), fmt_money(order["owner_share"]),
           fmt_money(round(order["price"] - order["admin_share"]
                           - order["owner_share"], 2))),
@@ -447,7 +449,7 @@ async def _user_card_text(db: Database, user) -> str:
         # а не слагаемое после числа заказов, как читалось прежде
         bonus_line = ""
         if total["bonus_sum"]:
-            bonus_line = h(" · в том числе бонусы {}",
+            bonus_line = h("\nв том числе бонусы: {}",
                            fmt_signed_money(total["bonus_sum"]))
         head += h("\nЗаказов в периоде: {}", total["orders_count"])
         head += h("\nК выплате: {}", fmt_money(total["due_sum"])) + bonus_line
@@ -535,7 +537,7 @@ async def users_list(cb: CallbackQuery, state: FSMContext, db: Database,
         page, chunk = 0, users[:kb.PAGE_SIZE]
     await _window(cb, ui,
                   join(f"<b>{title}</b>",
-                       h("Всего: {} · страница {}", len(users), page + 1),
+                       h("Всего: {}\nСтраница: {}", len(users), page + 1),
                        "Выберите учётную запись"),
                   kb.users_list_kb(chunk, prefix, page=page,
                                    has_next=start + kb.PAGE_SIZE < len(users)))
@@ -1407,7 +1409,7 @@ async def payout_pick(cb: CallbackQuery, db: Database, ui: Messenger) -> None:
         join("<b>Подтверждение выплаты</b>",
              h("Получатель: {} · {} · {}", user["handle"], user["name"],
                kb.ROLE_LABELS[user["role"]])
-             + h("\nЗаказов в периоде: {} · оборот {}", total["orders_count"],
+             + h("\nЗаказов в периоде: {}\nОборот: {}", total["orders_count"],
                  fmt_money(total["turnover"]))
              + bonus_line
              + h("\n<b>К выплате: {}</b>", fmt_money(total["due_sum"])),

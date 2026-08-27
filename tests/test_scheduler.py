@@ -126,7 +126,7 @@ async def test_restore_check_reports_success(db, ui, config, bot, worker):
     await restore_check_job(db, ui, config)
     await drain(worker)
     text = bot.records(next(iter(VR_ADMIN_IDS)))[0]
-    assert "Проверка резервной копии: ОК" in text and "заказов: 1" in text
+    assert "Проверка резервной копии: ОК" in text and "Заказов: 1" in text
 
 
 async def test_restore_check_alerts_when_there_are_no_backups(db, ui, config, bot, worker):
@@ -146,7 +146,7 @@ async def test_daily_digest_puts_delivery_and_errors_in_front_of_a_human(
     text = bot.records(next(iter(VR_ADMIN_IDS)))[0]
     assert "Сводка дня" in text
     assert "Ошибок в работе: 3" in text
-    assert "Доставка:" in text
+    assert "Доставка в очереди: 0" in text
     assert "Копий базы нет" in text
     assert errors.COUNTERS["errors"] == 0
 

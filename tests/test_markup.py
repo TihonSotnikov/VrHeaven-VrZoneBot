@@ -105,6 +105,37 @@ def test_report_renders_both_ways():
     validate_html(plain)
 
 
+def test_paragraph_keeps_its_line_breaks_in_a_native_message():
+    """Внутри <p> «\n» — обычный пробел разметки: пять фактов подвала
+    сводки уезжали в одну нечитаемую строку. Абзац отчёта собирается через
+    «\n», поэтому разрыв ставится на сборке — в единственном месте."""
+    footer = lines("Заказов за период: 10", "Оборот: 3 800 ₽",
+                   "<b>Остаток VR Heaven: 2 280 ₽</b>")
+    rich = Report("Сводка").add(footer).to_html(rich=True)
+
+    assert "<p>Заказов за период: 10<br>Оборот: 3 800 ₽<br>" in rich
+    assert "\n" not in rich, "нативное сообщение не полагается на символ"
+    validate_html(rich)
+
+
+def test_plain_report_keeps_the_same_line_breaks():
+    """Моноширинный вариант читает те же строки символом «\n»: один и тот
+    же отчёт разбит на строки одинаково обоими способами."""
+    footer = lines("Заказов за период: 10", "Оборот: 3 800 ₽")
+    plain = Report("Сводка").add(footer).to_html(rich=False)
+
+    assert "Заказов за период: 10\nОборот: 3 800 ₽" in plain
+    assert "<br>" not in plain
+    validate_html(plain)
+
+
+def test_breaks_leave_tables_and_titles_alone():
+    report = Report("Сводка").add(Table(["A"], [["1"]])).add("итог")
+    rich = report.to_html(rich=True)
+    assert "<br>" not in rich, "разрывать нечего — переводов строк нет"
+    validate_html(rich)
+
+
 def test_contract_validator_catches_real_failures():
     with pytest.raises(ContractError):
         validate_html("<b>не закрыт")

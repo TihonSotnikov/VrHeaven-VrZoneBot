@@ -200,7 +200,7 @@ async def restore_check_job(db: Database, ui: Messenger, config: Config) -> None
         await notify.to_super_admins(
             db, tx, config,
             join("<b>Проверка резервной копии: ОК</b>",
-                 h("Файл: {}\nЗаписей: {} · заказов: {} · выплат: {}\n"
+                 h("Файл: {}\nЗаписей: {}\nЗаказов: {}\nВыплат: {}\n"
                    "Версия схемы: {}", newest.name, stats["users"], stats["orders"],
                    stats["payouts"], stats["version"])),
             kind="backup", dedup=f"restore_ok:{newest.name}")
@@ -219,7 +219,7 @@ async def digest_job(db: Database, ui: Messenger, config: Config) -> None:
     backups = bk.list_backups(config.backup_dir)
     if backups:
         newest = backups[-1]
-        backup_note = h("Копии: {} шт., свежая {} ({} КБ)", len(backups),
+        backup_note = h("Копий базы: {}\nСвежая: {} ({} КБ)", len(backups),
                         newest.created.strftime("%d.%m %H:%M UTC"),
                         newest.size // 1024)
     else:
