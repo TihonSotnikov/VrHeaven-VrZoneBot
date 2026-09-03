@@ -330,15 +330,22 @@ class Database:
             (status, error[:500], record_id),
         )
 
-    async def outbox_stats(self) -> aiosqlite.Row:
-        return await self.fetchone(
-            "SELECT"
-            " COALESCE(SUM(status = 'pending'), 0) AS pending,"
-            " COALESCE(SUM(status = 'failed'), 0) AS failed,"
-            " COALESCE(SUM(status = 'dropped'), 0) AS dropped,"
-            " COALESCE(SUM(status = 'sent'), 0) AS sent"
-            " FROM outbox"
-        )
+    async def outbox_stats(self, since_iso: str | None = None) -> aiosqlite.Row:
+        """Состояние очереди Записей; since_iso ограничивает счёт периодом.
+
+        Без границы «не доставлено» и «отброшено» растут вечно: строки со
+        сбоем не убирает никто, и число перестаёт означать «сейчас что-то
+        не так» — оно означает «когда-то было».
+        """
+        sql = ("SELECT"
+               " COALESCE(SUM(status = 'pending'), 0) AS pending,"
+               " COALESCE(SUM(status = 'failed'), 0) AS failed,"
+               " COALESCE(SUM(status = 'dropped'), 0) AS dropped,"
+               " COALESCE(SUM(status = 'sent'), 0) AS sent"
+               " FROM outbox")
+        if since_iso is None:
+            return await self.fetchone(sql)
+        return await self.fetchone(sql + " WHERE created_at >= ?", (since_iso,))
 
     async def purge_sent_records(self, tx: Tx, before_iso: str) -> int:
         """Доставленные Записи в очереди больше не нужны — сами сообщения

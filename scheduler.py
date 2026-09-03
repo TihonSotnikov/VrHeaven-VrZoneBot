@@ -1,4 +1,4 @@
-"""Плановые задачи: отчёты дня выплат, копии базы, сводка дня, уборка.
+"""Плановые задачи: напоминание дня выплат, копии базы, проверка копий, уборка.
 
 Все сообщения задач уходят Записями через очередь: отчёт, не дошедший
 до получателя, останется видимой строкой со статусом, а не пропадёт
@@ -13,7 +13,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import backup as bk
-import errors
 import notify
 import reports
 from config import Config
@@ -22,7 +21,7 @@ from fsm_storage import STATE_TTL_DAYS
 from markup import h, join
 from messaging import Messenger, file_payload
 from roster import super_admin_ids
-from utils import utcnow
+from utils import fmt_money, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -35,12 +34,10 @@ def setup_scheduler(db: Database, ui: Messenger, config: Config,
                     storage=None) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=str(config.tz))
     tz = str(config.tz)
-    scheduler.add_job(payout_day_job, CronTrigger(day="1,15", hour=10, minute=0,
+    scheduler.add_job(payout_day_job, CronTrigger(day="10,25", hour=10, minute=0,
                                                   timezone=tz),
                       args=(db, ui, config), misfire_grace_time=3600)
     scheduler.add_job(backup_job, CronTrigger(hour=3, minute=0, timezone=tz),
-                      args=(db, ui, config), misfire_grace_time=3600)
-    scheduler.add_job(digest_job, CronTrigger(hour=9, minute=0, timezone=tz),
                       args=(db, ui, config), misfire_grace_time=3600)
     scheduler.add_job(restore_check_job,
                       CronTrigger(day_of_week="mon", hour=4, minute=0, timezone=tz),
@@ -56,16 +53,17 @@ PAYOUT_DAY_NOTE = ("Выплата проводится вручную; итог
                    "измениться, пока период не закрыт выплатой")
 
 
-async def _send_period_reports(db: Database, tx, rows, build_report,
-                               stamp: str) -> None:
-    """Отчёт текущего периода каждому получателю с ненулевой долей.
+async def _send_payout_reminders(db: Database, tx, rows, title: str,
+                                 stamp: str) -> None:
+    """Напоминание каждому получателю с ненулевым итогом периода.
 
-    Нулевой итог отчёта не получает — обещание «к выплате» было бы
+    Нулевой итог напоминания не получает — обещание «к выплате» было бы
     ложным. У администратора итог due_sum включает бонусы.
 
-    Отчёт закрывается одной припиской: сегодняшняя (выплата идёт вручную,
-    итог ещё может измениться) заменяет обычную про календарь — иначе
-    внизу стояли бы две фразы об одном и том же.
+    Раскладки по заказам здесь нет намеренно: она лежит за кнопкой меню
+    и открывается в любую минуту, а в напоминании занимала экран, ради
+    которого его никто не открывает. Остаётся то, за чем его читают:
+    сколько и на какое число.
     """
     for row in rows:
         if row["due_sum"] <= 0:
@@ -73,42 +71,41 @@ async def _send_period_reports(db: Database, tx, rows, build_report,
         if not await db.chats_for_user(row["id"]):
             continue
         user = await db.get_user(row["id"])
-        report = await build_report(user)
-        await notify.to_user(db, tx, user, report.to_html(rich=False),
-                             kind="period_report",
-                             dedup=f"payout_day:{stamp}:{row['id']}")
+        await notify.to_user(
+            db, tx, user,
+            join(h("<b>{}</b>", title),
+                 h("К выплате: {}", fmt_money(row["due_sum"])),
+                 PAYOUT_DAY_NOTE),
+            kind="period_report", dedup=f"payout_day:{stamp}:{row['id']}")
 
 
 async def payout_day_job(db: Database, ui: Messenger, config: Config) -> None:
-    """1-го и 15-го в 10:00: сводка VR Heaven и отчёты получателям.
+    """10-го и 25-го в 10:00: напоминание супер-админам и получателям.
 
     Период закрывается выплатой, а не календарём (SPEC §4), поэтому
     заголовок говорит «к выплате на <дату>», а не «период закрыт»:
     обещать закрытие, которого не происходит, — прямой путь к спору
     о числах, которые не сойдутся. Приписка снизу добавляет, что выплату
     проводят руками и итог ещё может измениться.
+
+    Ни одно из двух сообщений не несёт таблиц: день выплат — это повод
+    заплатить, а не разобрать период построчно. Разбор открывается
+    кнопкой меню и в этот день, и в любой другой.
     """
     today = datetime.now(config.tz)
     stamp = today.strftime("%Y-%m-%d")
     title = f"К выплате на {today.strftime('%d.%m.%Y')}"
-    summary = await reports.vrheaven_summary(db)
+    summary = await reports.vrheaven_summary(db, tables=False)
     summary.title = f"День выплат · {today.strftime('%d.%m.%Y')}"
     summary.add(PAYOUT_DAY_NOTE)
     async with db.write() as tx:
         await notify.to_super_admins(db, tx, config, summary.to_html(rich=False),
                                      kind="period_report",
                                      dedup=f"payout_day:{stamp}:vr")
-        await _send_period_reports(
-            db, tx, await db.owners_unpaid_summary(),
-            lambda user: reports.owner_period(db, user, config.tz, title=title,
-                                              note=PAYOUT_DAY_NOTE),
-            stamp)
-        await _send_period_reports(
-            db, tx, await db.admins_unpaid_summary(),
-            lambda user: reports.admin_period(db, user, config.tz, title=title,
-                                              with_series=False,
-                                              note=PAYOUT_DAY_NOTE),
-            stamp)
+        await _send_payout_reminders(
+            db, tx, await db.owners_unpaid_summary(), title, stamp)
+        await _send_payout_reminders(
+            db, tx, await db.admins_unpaid_summary(), title, stamp)
     ui.wake()
 
 
@@ -207,33 +204,7 @@ async def restore_check_job(db: Database, ui: Messenger, config: Config) -> None
     ui.wake()
 
 
-# ----------------------------------------------------------- Сводка и уборка
-
-async def digest_job(db: Database, ui: Messenger, config: Config) -> None:
-    """Ежедневно в 09:00: короткая сводка супер-админам.
-
-    Именно этого не хватало, когда уведомления молча переставали
-    доходить: числа доставки и ошибок попадают человеку на глаза каждое
-    утро, а не остаются в журнале сервера.
-    """
-    backups = bk.list_backups(config.backup_dir)
-    if backups:
-        newest = backups[-1]
-        backup_note = h("Копий базы: {}\nСвежая: {} ({} КБ)", len(backups),
-                        newest.created.strftime("%d.%m %H:%M UTC"),
-                        newest.size // 1024)
-    else:
-        backup_note = "Копий базы нет — проверьте задачу резервного копирования"
-    report = await reports.daily_digest(db, config.tz,
-                                        errors=errors.COUNTERS["errors"],
-                                        backup_note=backup_note)
-    errors.COUNTERS.clear()
-    async with db.write() as tx:
-        await notify.to_super_admins(
-            db, tx, config, report.to_html(rich=False), kind="digest",
-            dedup=f"digest:{datetime.now(config.tz).date()}")
-    ui.wake()
-
+# ------------------------------------------------------------------ Уборка
 
 async def housekeeping_job(db: Database, ui: Messenger, config: Config,
                            storage=None) -> None:
@@ -245,6 +216,10 @@ async def housekeeping_job(db: Database, ui: Messenger, config: Config,
         if removed:
             log.info("Убрано брошенных сценариев: %s", removed)
     keep = set(await super_admin_ids(db, config))
+    if config.superadmin_chat_id is not None:
+        # Окно панели живёт в теме группы, а не в личном чате: без этой
+        # строки уборка сочла бы его окном, за которым никого нет
+        keep.add(config.superadmin_chat_id)
     async with db.write() as tx:
         purged = await db.purge_sent_records(
             tx, (utcnow() - timedelta(days=30)).isoformat(timespec="seconds"))

@@ -3,7 +3,7 @@
 import os
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from config import Config
 from markup import h, join
@@ -62,11 +62,41 @@ def guide_caption(role: str) -> str:
     return h("<b>{}</b>\n\nКороткая инструкция — сохраните её в чате", title)
 
 
-# Личный чат: в группе бот показывал бы пароли и распределение денег
+def event_message(event: TelegramObject):
+    """Сообщение события: само сообщение или то, под которым нажали кнопку.
+
+    Утиная типизация, а не isinstance: тесты маршрутизации передают
+    в фильтры лёгкие двойники, и знать о них фильтру незачем.
+    """
+    return getattr(event, "message", None) or event
+
+
+def in_panel_topic(event: TelegramObject, config: Config) -> bool:
+    """Событие пришло в настроенную тему группы супер-админов."""
+    message = event_message(event)
+    chat = getattr(message, "chat", None)
+    return chat is not None and config.in_panel_topic(
+        chat.id, getattr(message, "message_thread_id", None))
+
+
+def _outside_panel_group(event: TelegramObject, config: Config) -> bool:
+    """Всё, кроме группы супер-админов.
+
+    Группу целиком ведёт роутер VR Heaven, и только одну её тему. Всё
+    прочее в этой группе не доходит ни до одного обработчика и остаётся
+    без ответа — так и задумано: privacy mode выключен, боту видно каждое
+    сообщение каждой темы, и молчание здесь единственно верный ответ.
+    """
+    chat = getattr(event_message(event), "chat", None)
+    return not config.is_panel_group(getattr(chat, "id", None))
+
+
+# Личный чат: в чужой группе бот показывал бы пароли и распределение денег
 # всем участникам, поэтому там он не работает вовсе.
 guard_router = Router(name="non-private")
-guard_router.message.filter(F.chat.type != "private")
-guard_router.callback_query.filter(F.message.chat.type != "private")
+guard_router.message.filter(F.chat.type != "private", _outside_panel_group)
+guard_router.callback_query.filter(F.message.chat.type != "private",
+                                   _outside_panel_group)
 
 
 @guard_router.message()

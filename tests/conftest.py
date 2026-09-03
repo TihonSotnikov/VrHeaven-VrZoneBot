@@ -50,8 +50,9 @@ def bot():
 
 
 @pytest.fixture
-def ui(bot, db):
-    return Messenger(bot, db)
+def ui(bot, db, config):
+    """Мессенджер знает конфигурацию: из неё берётся тема группы супер-админов."""
+    return Messenger(bot, db, config=config)
 
 
 @pytest.fixture

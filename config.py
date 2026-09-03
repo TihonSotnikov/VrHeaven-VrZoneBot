@@ -30,6 +30,33 @@ class Config:
     log_level: str = "INFO"
     env_name: str = "prod"
     guides_dir: str = field(default="guides")
+    # Группа супер-админов и тема в ней. Не заданы — панель живёт только
+    # в личных чатах, как и было
+    superadmin_chat_id: int | None = None
+    superadmin_topic_id: int | None = None
+
+    def is_panel_group(self, chat_id: int | None) -> bool:
+        """Групповой чат супер-админов — любая его тема."""
+        return (self.superadmin_chat_id is not None
+                and chat_id == self.superadmin_chat_id)
+
+    def in_panel_topic(self, chat_id: int | None, thread_id: int | None) -> bool:
+        """Настроенная тема — единственное место в группе, где бот отвечает.
+
+        Приватность бота держится на этом: в остальных темах он получает
+        каждое сообщение (privacy mode выключен) и не говорит ни слова.
+        """
+        return (self.is_panel_group(chat_id)
+                and thread_id == self.superadmin_topic_id)
+
+    def panel_thread_id(self, chat_id: int) -> int | None:
+        """Тема, в которую уходит сообщение этого чата; для остальных — None.
+
+        Без message_thread_id сообщение в форуме падает в «General», а не
+        в тему панели. Тема выводится из конфигурации по chat_id — поэтому
+        её не нужно ни хранить в очереди Записей, ни тащить через схему.
+        """
+        return self.superadmin_topic_id if self.is_panel_group(chat_id) else None
 
 
 def _read_token() -> str:
@@ -60,6 +87,21 @@ def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
     if value < minimum:
         raise RuntimeError(f"{name} должен быть не меньше {minimum}")
     return value
+
+
+def _opt_int_env(name: str) -> int | None:
+    """Необязательное целое: не задано — None, задано мусором — отказ старта.
+
+    Отдельно от _int_env: у id чата нет ни значения по умолчанию, ни
+    нижней границы — id группы отрицателен.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name} должен быть целым числом") from e
 
 
 def load_config() -> Config:
@@ -104,4 +146,6 @@ def load_config() -> Config:
         log_json=os.getenv("LOG_JSON", "").strip().lower() in {"1", "true", "yes"},
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         env_name=os.getenv("ENV", "prod").strip() or "prod",
+        superadmin_chat_id=_opt_int_env("SUPERADMIN_CHAT_ID"),
+        superadmin_topic_id=_opt_int_env("SUPERADMIN_TOPIC_ID"),
     )

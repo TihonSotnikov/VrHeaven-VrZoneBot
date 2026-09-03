@@ -60,9 +60,12 @@ def file_payload(path: str, filename: str) -> dict:
 class Messenger:
     """Единственная точка, откуда бот отправляет, правит и удаляет сообщения."""
 
-    def __init__(self, bot: Bot, db: Database, *, rich: bool = True):
+    def __init__(self, bot: Bot, db: Database, *, rich: bool = True, config=None):
         self.bot = bot
         self.db = db
+        # Нужна ради одного: темы форума, в которую уходят сообщения
+        # группы супер-админов. Без конфигурации ведёт себя как прежде
+        self.config = config
         # Нативные таблицы (Rich Messages) — свежая часть Bot API. Если
         # клиент или сервер их не принимает, бот сам переходит на
         # моноширинные таблицы и продолжает работать.
@@ -125,14 +128,27 @@ class Messenger:
             self.rich_enabled = False
             log.error("Нативные таблицы отключены после трёх отказов: %s", error)
 
+    def _thread(self, chat_id: int) -> int | None:
+        """Тема форума для этого чата — единственное место, где она берётся.
+
+        Отправка без message_thread_id кладёт сообщение в «General», а не
+        в тему панели, поэтому тему подставляет сама точка отправки:
+        забыть её в вызывающем коде негде — другого пути наружу нет.
+        Перестановка Окна (reanchor) идёт через тот же _send.
+        """
+        return self.config.panel_thread_id(chat_id) if self.config else None
+
     async def _send(self, chat_id: int, text: str, markup, rich: bool) -> Message:
+        thread_id = self._thread(chat_id)
         if rich:
             return await self.bot(SendRichMessage(
                 chat_id=chat_id,
+                message_thread_id=thread_id,
                 rich_message=InputRichMessage(html=text),
                 reply_markup=markup,
             ))
-        return await self.bot.send_message(chat_id, text, reply_markup=markup)
+        return await self.bot.send_message(chat_id, text, reply_markup=markup,
+                                           message_thread_id=thread_id)
 
     async def _edit(self, chat_id: int, message_id: int, text: str,
                     markup, rich: bool) -> None:
@@ -294,7 +310,8 @@ class Messenger:
             file = BufferedInputFile(base64.b64decode(document["b64"]),
                                      filename=document["filename"])
         message = await self.bot.send_document(
-            chat_id, file, caption=clamp(payload.get("text", ""), CAPTION_LIMIT)
+            chat_id, file, caption=clamp(payload.get("text", ""), CAPTION_LIMIT),
+            message_thread_id=self._thread(chat_id),
         )
         return message.message_id
 

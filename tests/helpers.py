@@ -94,6 +94,7 @@ class FakeBot:
 
     def __init__(self):
         self.sent = []       # (chat_id, message_id, text)
+        self.outgoing = []   # (chat_id, message_id, message_thread_id) — тема форума
         self.edited = []     # (chat_id, message_id, text); text=None для rich
         self.deleted = []    # (chat_id, message_id)
         self.documents = []  # (chat_id, message_id, caption, document)
@@ -130,6 +131,8 @@ class FakeBot:
             self._next_id += 1
             self.rich_sent.append((method.chat_id, self._next_id,
                                    method.rich_message.html))
+            self.outgoing.append((method.chat_id, self._next_id,
+                                  method.message_thread_id))
             self.live[(method.chat_id, self._next_id)] = {
                 "text": method.rich_message.html, "markup": method.reply_markup}
             self.last_markup = method.reply_markup
@@ -163,6 +166,8 @@ class FakeBot:
         self._fail_for(chat_id)
         self._next_id += 1
         self.sent.append((chat_id, self._next_id, text))
+        self.outgoing.append((chat_id, self._next_id,
+                              kwargs.get("message_thread_id")))
         self.live[(chat_id, self._next_id)] = {"text": text, "markup": reply_markup}
         self.last_markup = reply_markup
         return SimpleNamespace(message_id=self._next_id)
@@ -208,6 +213,8 @@ class FakeBot:
         self._fail_for(chat_id)
         self._next_id += 1
         self.documents.append((chat_id, self._next_id, caption, document))
+        self.outgoing.append((chat_id, self._next_id,
+                              kwargs.get("message_thread_id")))
         self.live[(chat_id, self._next_id)] = {"text": caption or "",
                                                "markup": reply_markup}
         return SimpleNamespace(message_id=self._next_id)
@@ -225,6 +232,14 @@ class FakeBot:
         """Живые сообщения чата, у которых есть кнопки."""
         return [mid for (chat, mid), data in self.live.items()
                 if chat == chat_id and data["markup"] is not None]
+
+    def threads(self, chat_id: int) -> list[int | None]:
+        """Темы форума, в которые ушли сообщения чата, в порядке отправки.
+
+        Без message_thread_id сообщение падает в «General» форума, а не
+        в тему панели, — и увидеть это можно только здесь.
+        """
+        return [thread for chat, _, thread in self.outgoing if chat == chat_id]
 
     def records(self, chat_id: int | None = None) -> list[str]:
         """Тексты Записей: сообщения без кнопок. Переставленное Окно

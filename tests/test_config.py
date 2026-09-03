@@ -18,7 +18,8 @@ def clean_env(monkeypatch, tmp_path):
         for name in ("BACKUP_DIR", "DATA_DIR", "BACKUP_KEEP_DAYS",
                      "BACKUP_KEEP_WEEKS", "BACKUP_KEEP_MONTHS",
                      "BACKUP_OFFHOST_CMD", "BOT_TOKEN_FILE",
-                     "CREDENTIALS_DIRECTORY", "LOG_JSON"):
+                     "CREDENTIALS_DIRECTORY", "LOG_JSON",
+                     "SUPERADMIN_CHAT_ID", "SUPERADMIN_TOPIC_ID"):
             monkeypatch.delenv(name, raising=False)
         for name, value in extra.items():
             monkeypatch.setenv(name, value)
@@ -112,4 +113,29 @@ def test_token_can_come_from_systemd_credentials(clean_env, tmp_path):
 def test_missing_token_file_is_reported(clean_env, tmp_path):
     clean_env(token="", BOT_TOKEN_FILE=str(tmp_path / "нет-файла"))
     with pytest.raises(RuntimeError, match="несуществующий файл"):
+        load_config()
+
+
+def test_super_admin_group_is_optional(clean_env):
+    """Не задана — панель живёт в личных чатах, как и до неё."""
+    clean_env()
+    config = load_config()
+    assert config.superadmin_chat_id is None
+    assert config.panel_thread_id(-1003779364996) is None
+    assert not config.is_panel_group(-1003779364996)
+
+
+def test_super_admin_group_and_topic_are_read_from_env(clean_env):
+    clean_env(SUPERADMIN_CHAT_ID="-1003779364996", SUPERADMIN_TOPIC_ID="539")
+    config = load_config()
+    assert config.in_panel_topic(-1003779364996, 539)
+    assert not config.in_panel_topic(-1003779364996, 7)     # соседняя тема
+    assert not config.in_panel_topic(-100999, 539)          # чужая группа
+    assert config.panel_thread_id(-1003779364996) == 539
+    assert config.panel_thread_id(999) is None              # личный чат
+
+
+def test_non_numeric_group_id_is_rejected(clean_env):
+    clean_env(SUPERADMIN_CHAT_ID="группа")
+    with pytest.raises(RuntimeError, match="целым числом"):
         load_config()

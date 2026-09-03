@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from db import Database
-from export import ACTION_LABELS
 from markup import Report, Table, h, lines
 from pricing import ladder_amount, normalize_reset, order_row_label, series_start
 from utils import fmt_dt, fmt_money, fmt_num, fmt_signed_money
@@ -18,13 +17,19 @@ from utils import fmt_dt, fmt_money, fmt_num, fmt_signed_money
 MAX_TABLE_ROWS = 25
 
 PERIOD_NOTE = ("Период закрывается выплатой, календарных границ нет. "
-               "Плановые выплаты — 1-го и 15-го числа")
+               "Плановые выплаты — 10-го и 25-го числа")
 
 
-def day_start_utc_iso(tz: ZoneInfo) -> str:
-    """Начало текущего локального дня в UTC — граница суток сводки дня."""
-    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    return start.astimezone(UTC).isoformat(timespec="seconds")
+def month_start_utc_iso(tz: ZoneInfo) -> tuple[str, datetime]:
+    """Начало текущего месяца: (граница UTC для БД, локальный момент для показа).
+
+    Отчёт о состоянии считается от 1-го числа, а не за сутки: сбой
+    доставки замечают не в тот же день, и суточное окно прячет ровно то,
+    ради чего отчёт открывают.
+    """
+    start = datetime.now(tz).replace(day=1, hour=0, minute=0, second=0,
+                                     microsecond=0)
+    return start.astimezone(UTC).isoformat(timespec="seconds"), start
 
 
 def series_start_utc_iso(reset_min, tz: ZoneInfo) -> tuple[str, datetime]:
@@ -60,8 +65,13 @@ def _summary_table(rows, with_bonus: bool = False) -> tuple[Table, float]:
     return Table(headers, table_rows), round(total_due, 2)
 
 
-async def vrheaven_summary(db: Database) -> Report:
+async def vrheaven_summary(db: Database, *, tables: bool = True) -> Report:
     """Сводка текущего периода: владельцы, администраторы и остаток VR Heaven.
+
+    tables=False оставляет один подвал — те же числа, посчитанные тем же
+    кодом, без расшифровок. Так сводку зовёт рассылка дня выплат:
+    напоминание читают с телефона, а расшифровка и без того лежит
+    за кнопкой меню.
 
     Показываются действующие (даже без заказов) и приостановленные
     с ненулевым остатком. «К выплате» администратора включает его
@@ -104,22 +114,25 @@ async def vrheaven_summary(db: Database) -> Report:
     owners_total, admins_total, bonus_total = 0.0, 0.0, 0.0
     if owners:
         table, owners_total = _summary_table(owners)
-        report.add(h("<b>Владельцы</b>")).add(table)
+        if tables:
+            report.add(h("<b>Владельцы</b>")).add(table)
     if admins:
         table, admins_total = _summary_table(admins, with_bonus=True)
-        report.add(h("<b>Администраторы</b>")).add(table)
+        if tables:
+            report.add(h("<b>Администраторы</b>")).add(table)
         bonus_total = round(sum(r["bonus_sum"] for r in admins), 2)
-    orders = await db.vrheaven_unpaid_orders()
-    if orders:
-        shown = orders[-MAX_TABLE_ROWS:]
-        report.add(h("<b>Заказы</b>")).add(Table(
-            ["Заказ", "Админ", "Цена, ₽", "Остаток VR Heaven, ₽"],
-            [[f"№{o['id']}", o["admin_handle"], fmt_num(o["price"]),
-              fmt_num(o["vr_share"])] for o in shown],
-        ))
-        if len(orders) > MAX_TABLE_ROWS:
-            report.add(h("Показаны последние {} из {} заказов",
-                         MAX_TABLE_ROWS, len(orders)))
+    if tables:
+        orders = await db.vrheaven_unpaid_orders()
+        if orders:
+            shown = orders[-MAX_TABLE_ROWS:]
+            report.add(h("<b>Заказы</b>")).add(Table(
+                ["Заказ", "Админ", "Цена, ₽", "Остаток VR Heaven, ₽"],
+                [[f"№{o['id']}", o["admin_handle"], fmt_num(o["price"]),
+                  fmt_num(o["vr_share"])] for o in shown],
+            ))
+            if len(orders) > MAX_TABLE_ROWS:
+                report.add(h("Показаны последние {} из {} заказов",
+                             MAX_TABLE_ROWS, len(orders)))
     vr_total = await db.vrheaven_unpaid_total()
     vr_remainder = round(vr_total["share_sum"] - bonus_total, 2)
     # По факту на строку: пять величин в одну строку не читаются, а внутри
@@ -298,49 +311,42 @@ def payout_history(payouts, tz: ZoneInfo, handle: str) -> Report:
     ))
 
 
-async def daily_digest(db: Database, tz: ZoneInfo, *, errors: int,
-                       backup_note: str) -> Report:
-    """Утренняя сводка супер-админам: обороты, доставка, копии, ошибки.
+async def system_report(db: Database, tz: ZoneInfo, *, errors: int,
+                        backups) -> Report:
+    """Состояние самого бота по команде /system: доставка, сбои, копии.
 
-    Смысл ровно один: то, что раньше молча оседало в журнале сервера,
-    теперь каждый день попадает человеку на глаза.
+    Здесь только здоровье бота. Заказы, оборот и отмены отсюда убраны
+    намеренно: деньги живут в сводке, и один экран, где к обороту
+    приклеено число недоставленных сообщений, не отвечает толком ни на
+    один из двух вопросов.
+
+    Подписи называют то, что меряют. «Доставка в очереди» и «Отброшено»
+    не говорили человеку ничего: речь о сообщениях, которые бот шлёт
+    людям — чеках, уведомлениях, отчётах, — и ровно так они и названы.
+
+    Счётчик сбоев живёт в памяти процесса и обнуляется его перезапуском,
+    поэтому подпись говорит, с какого момента он считает: раньше его
+    чистила утренняя сводка, и «за сутки» было правдой; теперь отчёт
+    зовут руками, и обнулять его нажатием одного из трёх супер-админов
+    значило бы прятать числа от двух остальных.
     """
-    report = Report(f"Сводка дня · {datetime.now(tz).strftime('%d.%m.%Y')}")
-    since = day_start_utc_iso(tz)
-    orders = await db.fetchone(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(price), 0) AS turnover FROM orders"
-        " WHERE created_at >= ? AND cancelled_at IS NULL", (since,)
-    )
-    cancelled = await db.fetchone(
-        "SELECT COUNT(*) AS n FROM orders WHERE cancelled_at >= ?", (since,)
-    )
-    outbox = await db.outbox_stats()
-    # Два блока, а не пять абзацев: сначала дела клуба, потом состояние
-    # самого бота. Пять пустых строк между однострочными фактами
-    # растягивали сводку на экран, ничего к ней не добавляя. Внутри блока —
-    # по факту на строку: заказы, оборот и отмены мерят разное
+    since_iso, since = month_start_utc_iso(tz)
+    report = Report(f"Состояние бота · {datetime.now(tz).strftime('%d.%m.%Y %H:%M')}")
+    outbox = await db.outbox_stats(since_iso)
     report.add(lines(
-        h("Заказов за сутки: {}", orders["n"]),
-        h("Оборот: {}", fmt_money(orders["turnover"])),
-        h("Отмен: {}", cancelled["n"]),
+        h("<b>Сообщения бота людям</b> — чеки, уведомления, отчёты"),
+        h("Считаем с {}", since.strftime("%d.%m.%Y")),
+        h("Ждут отправки: {}", outbox["pending"]),
+        h("Не доставлены, попытки закончились: {}", outbox["failed"]),
+        h("Не доставлены, чат недоступен или файл потерян: {}", outbox["dropped"]),
     ))
-    report.add(lines(
-        h("Доставка в очереди: {}", outbox["pending"]),
-        h("Не доставлено: {}", outbox["failed"]),
-        h("Отброшено: {}", outbox["dropped"]),
-        h("Ошибок в работе: {}", errors),
-        backup_note,
-    ))
-    actions = await db.audit_since(since)
-    if actions:
-        counts: dict[str, int] = {}
-        for row in actions:
-            counts[row["action"]] = counts.get(row["action"], 0) + 1
-        report.add(Table(
-            # Человеческие названия, а не коды журнала: сводку читает
-            # владелец бизнеса, а «order.create» — слово для инженера
-            ["Действие", "Раз"],
-            sorted(([ACTION_LABELS.get(action, action), n]
-                    for action, n in counts.items()), key=lambda r: -r[1]),
-        ))
+    report.add(h("Сбоев при обработке нажатий и команд, с запуска бота: {}",
+                 errors))
+    if backups:
+        newest = backups[-1]
+        report.add(h("Копий базы: {}\nСвежая: {} ({} КБ)", len(backups),
+                     newest.created.strftime("%d.%m %H:%M UTC"),
+                     newest.size // 1024))
+    else:
+        report.add("Копий базы нет — проверьте задачу резервного копирования")
     return report

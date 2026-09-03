@@ -24,6 +24,7 @@ from handlers.vrheaven import (
     admin_add_name,
     admin_add_pick_owner,
     admin_owner_set,
+    cmd_system,
     discount_day_toggle,
     discount_days_menu,
     export_csv,
@@ -73,6 +74,26 @@ def _cb(data, **kwargs):
 
 def _msg(text):
     return fake_msg(text, chat_id=VR_CHAT)
+
+
+# ------------------------------------------------------------- Состояние бота
+
+async def test_system_report_comes_on_demand_and_only_about_the_bot(
+        db, ui, config, bot, worker):
+    """Прежняя сводка приходила в 09:00, когда её никто не ждал. Теперь
+    то же самое приходит по команде — и только о самом боте."""
+    await _panel(db)
+    message = _msg("/system")
+    await cmd_system(message, db, ui, config)
+    await drain(worker)
+
+    text = bot.records(VR_CHAT)[0]
+    assert "Состояние бота" in text
+    assert "Сообщения бота людям" in text and "Ждут отправки: 0" in text
+    assert "Копий базы нет" in text
+    for word in ("Заказов", "борот", "Отмен"):
+        assert word not in text, word
+    assert message.delete.await_count == 1        # команда в чате не остаётся
 
 
 # ------------------------------------------------------------------- Доступ

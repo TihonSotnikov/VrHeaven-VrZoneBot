@@ -111,6 +111,8 @@ uv run python invariants.py /путь/к/adminbot.db
 | `BACKUP_DIR` | каталог копий | `DATA_DIR/backups` |
 | `BACKUP_KEEP_DAYS` / `_WEEKS` / `_MONTHS` | ротация копий | 7 / 8 / 12 |
 | `BACKUP_OFFHOST_CMD` | команда выгрузки копии, `{path}` и `{name}` | не задана |
+| `SUPERADMIN_CHAT_ID` | группа супер-админов: панель открывается и там | не задана |
+| `SUPERADMIN_TOPIC_ID` | тема этой группы; вне её бот в группе молчит | не задана |
 | `LOG_JSON`, `LOG_LEVEL` | журналирование | `false`, `INFO` |
 
 На сервере токен приходит через `LoadCredential` systemd и в окружении

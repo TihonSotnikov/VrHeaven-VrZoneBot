@@ -45,7 +45,20 @@ async def to_super_admins(db: Database, tx: Tx, config: Config, text: str, *,
                           document: dict | None = None,
                           exclude_tg_id: int | None = None) -> int:
     """Запись каждому супер-админу, кроме инициатора: он видит результат
-    на собственном Окне и второй раз о нём читать не должен."""
+    на собственном Окне и второй раз о нём читать не должен.
+
+    Настроена группа супер-админов — Запись ровно одна и уходит в её
+    тему. Инициатор не исключается: Окно там общее на троих, и молчание
+    ради него оставило бы двух остальных без новости вовсе. Ради этого
+    группа и заводится — личные чаты с ботом супер-админы удаляют.
+    """
+    if config.superadmin_chat_id is not None:
+        await db.enqueue_record(
+            tx, chat_id=config.superadmin_chat_id, kind=kind, text=text,
+            document=document,
+            dedup_key=f"{dedup}:chat:{config.superadmin_chat_id}" if dedup else None,
+        )
+        return 1
     sent = 0
     for tg_id in await super_admin_ids(db, config):
         if tg_id == exclude_tg_id:

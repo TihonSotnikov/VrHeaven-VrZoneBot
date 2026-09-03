@@ -1,4 +1,4 @@
-"""Плановые задачи: расписание, отчёты дня выплат, копии, сводка, уборка."""
+"""Плановые задачи: расписание, напоминание дня выплат, копии, уборка."""
 
 from datetime import timedelta
 
@@ -13,11 +13,9 @@ from helpers import (
 )
 
 import backup as bk
-import errors
 from fsm_storage import SQLiteStorage
 from scheduler import (
     backup_job,
-    digest_job,
     housekeeping_job,
     payout_day_job,
     restore_check_job,
@@ -32,10 +30,10 @@ ADMIN_CHAT = 101
 def test_jobs_are_scheduled_in_the_configured_timezone(db, ui, config):
     scheduler = setup_scheduler(db, ui, config)
     jobs = {job.func.__name__: job for job in scheduler.get_jobs()}
-    assert set(jobs) == {"payout_day_job", "backup_job", "digest_job",
+    assert set(jobs) == {"payout_day_job", "backup_job",
                          "restore_check_job", "housekeeping_job"}
     payout = {f.name: str(f) for f in jobs["payout_day_job"].trigger.fields}
-    assert payout["day"] == "1,15" and payout["hour"] == "10"
+    assert payout["day"] == "10,25" and payout["hour"] == "10"
     backup = {f.name: str(f) for f in jobs["backup_job"].trigger.fields}
     assert backup["day"] == "*" and backup["hour"] == "3"
     for job in jobs.values():
@@ -62,6 +60,7 @@ async def test_payout_day_reports_reach_everyone_with_a_share(
 
     owner_report = bot.records(OWNER_CHAT)[0]
     assert "К выплате на " in owner_report
+    assert "К выплате: 237 ₽" in owner_report      # 30% от 790
     assert "Выплата проводится вручную" in owner_report
     # период закрывает выплата, а не календарь — обещания «период закрыт» нет
     assert "Учётный период закрыт" not in owner_report
@@ -70,7 +69,30 @@ async def test_payout_day_reports_reach_everyone_with_a_share(
     import reports as rp
     assert rp.PERIOD_NOTE not in owner_report
     assert rp.PERIOD_NOTE not in bot.records(ADMIN_CHAT)[0]
+    assert "К выплате: 79 ₽" in bot.records(ADMIN_CHAT)[0]
     vr_report = bot.records(next(iter(VR_ADMIN_IDS)))[0]
+    assert "Остаток VR Heaven: 474 ₽" in vr_report
+
+
+async def test_payout_day_sends_reminders_without_tables(db, ui, config, bot, worker):
+    """День выплат напоминает заплатить, а не раскладывает период по строкам:
+    расшифровка живёт за кнопкой меню и открывается когда угодно."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await bind(db, owner, OWNER_CHAT)
+    await bind(db, admin, ADMIN_CHAT)
+    await make_order(db, admin, owner, price=790, admin_share=79)
+
+    await payout_day_job(db, ui, config)
+    await drain(worker)
+    for chat in (OWNER_CHAT, ADMIN_CHAT, next(iter(VR_ADMIN_IDS))):
+        text = bot.records(chat)[0]
+        assert "<pre>" not in text and "<table>" not in text, chat
+        assert len(text) < 500, chat
+    vr_report = bot.records(next(iter(VR_ADMIN_IDS)))[0]
+    # итоги остались все до одного — убраны только расшифровки
+    assert "К выплате владельцам: 237 ₽" in vr_report
+    assert "К выплате администраторам: 79 ₽" in vr_report
     assert "Остаток VR Heaven: 474 ₽" in vr_report
 
 
@@ -135,22 +157,6 @@ async def test_restore_check_alerts_when_there_are_no_backups(db, ui, config, bo
     assert "Копий нет вовсе" in bot.records(next(iter(VR_ADMIN_IDS)))[0]
 
 
-async def test_daily_digest_puts_delivery_and_errors_in_front_of_a_human(
-        db, ui, config, bot, worker):
-    owner = await create_owner(db)
-    admin = await create_admin(db, owner)
-    await make_order(db, admin, owner, price=300)
-    errors.COUNTERS["errors"] = 3
-    await digest_job(db, ui, config)
-    await drain(worker)
-    text = bot.records(next(iter(VR_ADMIN_IDS)))[0]
-    assert "Сводка дня" in text
-    assert "Ошибок в работе: 3" in text
-    assert "Доставка в очереди: 0" in text
-    assert "Копий базы нет" in text
-    assert errors.COUNTERS["errors"] == 0
-
-
 async def test_housekeeping_clears_abandoned_state_and_delivered_records(
         db, ui, config):
     storage = SQLiteStorage(db)
@@ -170,6 +176,19 @@ async def test_housekeeping_clears_abandoned_state_and_delivered_records(
     assert await storage.get_data(key) == {}
     assert await db.get_window(4242) is None
     assert await db.fetchall("SELECT * FROM outbox") == []
+
+
+async def test_housekeeping_keeps_the_panel_group_window(db, ui, config):
+    """Окно панели живёт в теме группы: уборка не должна счесть его брошенным."""
+    from dataclasses import replace
+    group = replace(config, superadmin_chat_id=-100500, superadmin_topic_id=7)
+    old = (utcnow() - timedelta(days=90)).isoformat(timespec="seconds")
+    async with db.write() as tx:
+        await db.save_window(tx, -100500, 1, text="панель", markup_json=None,
+                             rich=False)
+        await tx.execute("UPDATE chat_windows SET updated_at = ?", (old,))
+    await housekeeping_job(db, ui, group, None)
+    assert await db.get_window(-100500) is not None
 
 
 async def test_housekeeping_keeps_super_admin_windows(db, ui, config):

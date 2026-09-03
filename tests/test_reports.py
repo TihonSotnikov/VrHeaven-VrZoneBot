@@ -499,18 +499,49 @@ async def test_summary_footer_puts_every_metric_on_its_own_line(db):
             assert not other, f"{metric} склеен с {other} при rich={rich}"
 
 
-async def test_daily_digest_puts_every_metric_on_its_own_line(db, config):
-    owner = await create_owner(db)
-    admin = await create_admin(db, owner)
-    await make_order(db, admin, owner, price=700)
-    report = await reports.daily_digest(db, TZ, errors=3, backup_note="Копия: ок")
+async def test_system_report_names_what_each_number_measures(db, config):
+    """Подписи говорят, о чём число: это исходящие сообщения самого бота,
+    а не что-то абстрактное «в очереди»."""
+    report = await reports.system_report(db, TZ, errors=3, backups=[])
 
     for rich in (True, False):
         shown = _visible_lines(report.to_html(rich=rich))
-        for metric in ("Заказов за сутки: 1", f"Оборот: {fmt_money(700)}",
-                       "Отмен: 0", "Доставка в очереди: 0", "Не доставлено: 0",
-                       "Отброшено: 0", "Ошибок в работе: 3"):
+        for metric in ("Сообщения бота людям — чеки, уведомления, отчёты",
+                       "Ждут отправки: 0",
+                       "Не доставлены, попытки закончились: 0",
+                       "Не доставлены, чат недоступен или файл потерян: 0",
+                       "Сбоев при обработке нажатий и команд, с запуска бота: 3",
+                       "Копий базы нет — проверьте задачу резервного копирования"):
             assert metric in shown, f"{metric} при rich={rich}"
+
+
+async def test_system_report_is_about_the_bot_and_not_about_money(db):
+    """Заказы, оборот и отмены убраны: деньги живут в сводке."""
+    owner = await create_owner(db)
+    admin = await create_admin(db, owner)
+    await make_order(db, admin, owner, price=700)
+    html = await _html(await reports.system_report(db, TZ, errors=0, backups=[]))
+    for word in ("Заказов", "борот", "Отмен"):
+        assert word not in html, word
+
+
+async def test_system_report_counts_delivery_from_the_first_of_the_month(db):
+    """Без границы периода «не доставлено» растёт вечно: строку со сбоем
+    не убирает никто, и число перестаёт означать «сейчас что-то не так»."""
+    from datetime import UTC, datetime, timedelta
+    async with db.write() as tx:
+        await db.enqueue_record(tx, chat_id=1, kind="test", text="прошлый месяц")
+        await db.enqueue_record(tx, chat_id=2, kind="test", text="этот месяц")
+    long_ago = (datetime.now(UTC).replace(day=1) - timedelta(days=1)
+                ).isoformat(timespec="seconds")
+    async with db.write() as tx:
+        await tx.execute("UPDATE outbox SET status = 'failed', created_at = ?"
+                         " WHERE chat_id = 1", (long_ago,))
+        await tx.execute("UPDATE outbox SET status = 'failed' WHERE chat_id = 2")
+
+    shown = _visible_lines(await _html(
+        await reports.system_report(db, TZ, errors=0, backups=[])))
+    assert "Не доставлены, попытки закончились: 1" in shown
 
 
 async def test_admin_statistics_put_every_metric_on_its_own_line(db):

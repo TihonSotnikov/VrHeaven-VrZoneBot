@@ -11,11 +11,13 @@ import logging
 import re
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart, Filter
+from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
+import backup as bk
+import errors
 import export as xp
 import keyboards as kb
 import notify
@@ -23,7 +25,13 @@ import reports
 from config import Config
 from db import Actor, Database
 from errors import STALE_BUTTON, cb_int, cb_ints, cb_tail
-from handlers.common import SUPPORT_LINE, guide_bytes, guide_caption
+from handlers.common import (
+    SUPPORT_LINE,
+    event_message,
+    guide_bytes,
+    guide_caption,
+    in_panel_topic,
+)
 from markup import (
     COMMENT_MAX,
     CONTACT_MAX,
@@ -94,9 +102,22 @@ class SuperAdminFilter(Filter):
         return user is not None and await is_super_admin(db, config, user.id)
 
 
+def panel_chat(event: TelegramObject, config: Config) -> bool:
+    """Где открывается панель: личный чат и настроенная тема группы.
+
+    Группа не задана — остаются одни личные чаты, как было. Задана —
+    три супер-админа делят одно Окно в одной теме и удаляют личные чаты
+    с ботом; личный чат при этом продолжает работать запасным входом.
+    """
+    chat = getattr(event_message(event), "chat", None)
+    if chat is None:
+        return False
+    return chat.type == "private" or in_panel_topic(event, config)
+
+
 router = Router(name="vrheaven")
-router.message.filter(F.chat.type == "private", SuperAdminFilter())
-router.callback_query.filter(F.message.chat.type == "private", SuperAdminFilter())
+router.message.filter(panel_chat, SuperAdminFilter())
+router.callback_query.filter(panel_chat, SuperAdminFilter())
 
 
 class AddOwnerSG(StatesGroup):
@@ -164,6 +185,26 @@ async def cmd_start(message: Message, state: FSMContext, ui: Messenger) -> None:
     # Messenger.window. Правка прежнего Окна проходит и в очищенном чате,
     # где человеку её уже не увидеть
     await ui.window(message.chat.id, MENU_TEXT, kb.vrheaven_menu_kb(), fresh=True)
+
+
+@router.message(Command("system"))
+async def cmd_system(message: Message, db: Database, ui: Messenger,
+                     config: Config) -> None:
+    """Состояние бота по требованию — вместо сводки, приходившей в 09:00.
+
+    Ежедневная сводка приходила, когда её никто не ждал, и молчала,
+    когда её ждали. Здесь то же самое приходит по команде: Записью,
+    которая остаётся в чате, а не Окном, которое сотрётся следующим
+    экраном.
+    """
+    await ui.drop_user_message(message)
+    report = await reports.system_report(
+        db, config.tz, errors=errors.COUNTERS["errors"],
+        backups=bk.list_backups(config.backup_dir))
+    async with db.write() as tx:
+        await notify.to_chat(db, tx, message.chat.id, report.to_html(rich=False),
+                             kind="system")
+    ui.wake()
 
 
 @router.callback_query(F.data == "am")

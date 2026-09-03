@@ -39,8 +39,13 @@ IDEMPOTENT_METHODS = (EditMessageText, EditMessageReplyMarkup, DeleteMessage,
                       AnswerCallbackQuery)
 
 GLOBAL_RATE = 25.0        # запросов в секунду суммарно (лимит Telegram ~30)
-CHAT_RATE = 1.0           # запросов в секунду в один чат
+CHAT_RATE = 1.0           # запросов в секунду в один личный чат
 CHAT_BURST = 5.0
+# Групповой чат Telegram ограничивает жёстче личного — примерно 20
+# сообщениями в минуту, — а вся переписка панели теперь сходится в один
+# такой чат: три супер-админа, все уведомления, все отчёты
+GROUP_CHAT_RATE = 1 / 3
+GROUP_CHAT_BURST = 3.0
 MAX_RETRIES = 3
 
 # Ведёрко заводится на каждый чат, а писать боту может кто угодно: без
@@ -94,10 +99,13 @@ def _bucket_for(buckets: dict[int, _Bucket], key: int, rate: float,
 
 class ThrottleMiddleware(BaseRequestMiddleware):
     def __init__(self, *, global_rate: float = GLOBAL_RATE,
-                 chat_rate: float = CHAT_RATE, max_retries: int = MAX_RETRIES):
+                 chat_rate: float = CHAT_RATE,
+                 group_rate: float = GROUP_CHAT_RATE,
+                 max_retries: int = MAX_RETRIES):
         self._global = _Bucket(global_rate, global_rate)
         self._chats: dict[int, _Bucket] = {}
         self._chat_rate = chat_rate
+        self._group_rate = group_rate
         self._max_retries = max_retries
         self._lock = asyncio.Lock()
 
@@ -105,8 +113,12 @@ class ThrottleMiddleware(BaseRequestMiddleware):
         async with self._lock:
             delay = self._global.take()
             if chat_id is not None:
-                bucket = _bucket_for(self._chats, chat_id, self._chat_rate,
-                                     CHAT_BURST)
+                # Групповой чат виден по знаку id: у групп он отрицателен
+                group = chat_id < 0
+                bucket = _bucket_for(
+                    self._chats, chat_id,
+                    self._group_rate if group else self._chat_rate,
+                    GROUP_CHAT_BURST if group else CHAT_BURST)
                 delay = max(delay, bucket.take())
         if delay > 0:
             await asyncio.sleep(delay)

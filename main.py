@@ -123,7 +123,7 @@ async def run() -> None:
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     bot.session.middleware(ThrottleMiddleware())
 
-    ui = Messenger(bot, db)
+    ui = Messenger(bot, db, config=config)
     worker = OutboxWorker(bot, db, ui, config)
     ui.on_enqueue = worker.wake
 
