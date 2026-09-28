@@ -1,6 +1,6 @@
 [project]
 name = "tgbot-for-admins"
-version = "1.2.1"
+version = "1.4.1"
 description = "Telegram-бот учёта выручки VR-зоны: заказы VR-сеансов, доли владельцев и администраторов, выплаты"
 readme = "README.md"
 requires-python = ">=3.12"
