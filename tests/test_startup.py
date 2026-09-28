@@ -153,3 +153,39 @@ async def test_pre_migration_snapshot_is_taken_despite_a_discrepancy(db, config)
     info = await bk.create_backup(config, bk.REASON_PRE_MIGRATION)
     assert info.problems, "расхождение обязано остаться видимым"
     assert bk.list_backups(config.backup_dir), "снимок обязан появиться"
+
+
+async def test_first_start_on_an_empty_data_directory(config):
+    """Базы ещё нет: снимать нечего. Соединение создаёт файл само, и
+    раньше пустой файл принимался за прежнюю базу — его снимок не
+    проходил проверку, и первый запуск был невозможен."""
+    from main import open_database
+    db = await open_database(config)
+    try:
+        assert await db.schema_version() > 0
+    finally:
+        await db.close()
+    assert not bk.list_backups(config.backup_dir)
+
+
+async def test_failed_migration_closes_the_database(config, monkeypatch):
+    """Незакрытое соединение держит поток: процесс, которому запуск не
+    удался, не завершался, а висел."""
+    import db as db_module
+    from main import open_database
+
+    async def broken(conn, *, before_migration=None):
+        raise RuntimeError("миграция не удалась")
+
+    closed = []
+    original_close = db_module.Database.close
+
+    async def tracked_close(self):
+        closed.append(True)
+        await original_close(self)
+
+    monkeypatch.setattr(db_module, "apply_migrations", broken)
+    monkeypatch.setattr(db_module.Database, "close", tracked_close)
+    with pytest.raises(RuntimeError, match="миграция не удалась"):
+        await open_database(config)
+    assert closed

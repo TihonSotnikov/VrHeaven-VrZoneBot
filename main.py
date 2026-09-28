@@ -94,6 +94,36 @@ async def boot_backup(config: Config) -> None:
         log.exception("Не удалось снять копию базы перед запуском")
 
 
+async def open_database(config: Config) -> Database:
+    """Открывает базу и применяет миграции со снимком перед ними.
+
+    Существование файла проверяется до открытия: соединение создаёт файл
+    само, и новая пустая база иначе выглядела бы прежней — её снимок не
+    прошёл бы проверку, и первый запуск был бы невозможен.
+    """
+    existed = os.path.exists(config.db_path)
+    db = Database(config.db_path)
+
+    async def before_migration(pending) -> None:
+        log.warning("Ожидают применения миграции: %s",
+                    ", ".join(f"v{m.version} {m.name}" for m in pending))
+        if existed:
+            # Снимок — единственная точка отката схемы, поэтому неудача
+            # здесь миграцию отменяет. Отменяет её непригодный файл, а не
+            # спор о деньгах: тот уезжает в журнал и миграции не мешает
+            info = await bk.create_backup(config, bk.REASON_PRE_MIGRATION)
+            log.warning("Копия перед миграцией: %s", info.name)
+            _log_discrepancies(info)
+
+    try:
+        await db.init(before_migration=before_migration)
+    except BaseException:
+        # Незакрытое соединение держит поток, и процесс не завершался бы
+        await db.close()
+        raise
+    return db
+
+
 async def run() -> None:
     config = load_config()
     setup_logging(json_output=config.log_json, level=config.log_level)
@@ -103,20 +133,11 @@ async def run() -> None:
 
     await boot_backup(config)
 
-    db = Database(config.db_path)
-
-    async def before_migration(pending) -> None:
-        log.warning("Ожидают применения миграции: %s",
-                    ", ".join(f"v{m.version} {m.name}" for m in pending))
-        if os.path.exists(config.db_path):
-            # Снимок — единственная точка отката схемы, поэтому неудача
-            # здесь миграцию отменяет. Отменяет её непригодный файл, а не
-            # спор о деньгах: тот уезжает в журнал и миграции не мешает
-            info = await bk.create_backup(config, bk.REASON_PRE_MIGRATION)
-            log.warning("Копия перед миграцией: %s", info.name)
-            _log_discrepancies(info)
-
-    await db.init(before_migration=before_migration)
+    try:
+        db = await open_database(config)
+    except BaseException:
+        lock.release()
+        raise
     log.info("Схема базы: версия %s", await db.schema_version())
 
     bot = Bot(token=config.bot_token,
@@ -148,9 +169,12 @@ async def run() -> None:
     scheduler.start()
     worker.start()
 
-    await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
-    log.info("Бот запущен: база %s, копии %s", config.db_path, config.backup_dir)
     try:
+        # Внутри try: отказ Telegram здесь (неверный токен) иначе оставил
+        # бы планировщик и базу открытыми, и процесс не завершался бы
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Главное меню")])
+        log.info("Бот запущен: база %s, копии %s", config.db_path, config.backup_dir)
         await dp.start_polling(bot, handle_signals=True)
     except TelegramConflictError:
         # Тот же токен уже опрашивает Telegram из другого места:
