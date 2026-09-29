@@ -12,11 +12,10 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/order-demo.png" width="900" alt="Один заказ глазами трёх ролей">
-</p>
-
-<p align="center">
-  Один заказ глазами трёх ролей. Тексты - настоящий вывод бота из тестового стенда.
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-dark.png">
+    <img src="docs/assets/demo-light.png" alt="Администратор оформляет заказ со скидкой и получает вознаграждение по лесенке серии, владелец клуба видит свою долю, VR Heaven видит полное деление заказа, сводку и статистику администратора">
+  </picture>
 </p>
 
 ## Применение
